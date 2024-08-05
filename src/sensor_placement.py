@@ -357,14 +357,19 @@ class SensorPlacement:
         
         vector_ineq = matrix([matrix(np.tile(0,self.n)),
                               matrix(np.tile(1,self.n)),
-                              -self.s,
+                              -self.s.astype(np.double),
                               matrix(np.tile(-(1-epsilon),len(locations_monitored))),
                               matrix(np.tile(epsilon,len(locations_unmonitored)))],tc='d')
                               #matrix(np.tile(epsilon,len(locations_forbidden))) ],tc='d')
         # LMI constraint
         #matrix_sdp = [sparse([np.reshape(-rho*Psi[i,:][None,:].T@Psi[i,:][None,:],newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
         #vector_sdp = [matrix(-1*Psi[i,:][None,:].T@Psi[i,:][None,:]) for i in range(self.n)]
-        matrix_sdp = [sparse([np.reshape(np.tril(-rho*Psi[i,:][None,:].T@Psi[i,:][None,:]),newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
+        if type(rho) in [float,np.float32,np.float64]:
+            matrix_sdp = [sparse([np.reshape(np.tril(-rho*Psi[i,:][None,:].T@Psi[i,:][None,:]),newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
+        elif len(rho) == 1:
+            matrix_sdp = [sparse([np.reshape(np.tril(-rho[0]*Psi[i,:][None,:].T@Psi[i,:][None,:]),newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
+        else:
+            matrix_sdp = [sparse([np.reshape(np.tril(-rho[i]*Psi[i,:][None,:].T@Psi[i,:][None,:]),newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
         print(f'Basis type: {type(Psi)}. Basis dtype: {Psi.dtype}')
         vector_sdp = [matrix(np.tril(-1*Psi[i,:][None,:].T@Psi[i,:][None,:]).astype(float)) for i in range(self.n)]
         # solver and solution
@@ -372,7 +377,7 @@ class SensorPlacement:
         try:
             self.problem = solvers.sdp(c,Gl=matrix_ineq,hl=vector_ineq,Gs=matrix_sdp,hs=vector_sdp,verbose=True,solver='dsdp',primalstart=primal_start)
         except:    
-            self.problem = solvers.sdp(c,Gl=matrix_ineq,hl=vector_ineq,Gs=matrix_sdp,hs=vector_sdp,verbose=True,solver='dsdp')
+            self.problem = solvers.sdp(c,Gl=matrix_ineq,hl=vector_ineq,Gs=matrix_sdp,hs=vector_sdp,verbose=True)
         self.h = np.array(self.problem['x'])
 
 

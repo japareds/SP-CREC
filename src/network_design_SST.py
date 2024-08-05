@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import argparse
+import warnings
 from abc import ABC,abstractmethod
 import netCDF4
 import pandas as pd
@@ -28,7 +29,7 @@ import sensor_placement as sp
 parser = argparse.ArgumentParser(prog='IRNet-sensorPlacement',
                                  description='Iterative Reweighted Network design.',
                                  epilog='---')
-# action to perform
+# action to perform-
 parser.add_argument('--determine_sparsity',help='determine signal saprsity via SVD',action='store_true')
 parser.add_argument('--design_network',help='Perform IRNet algorithm',action='store_true')
 parser.add_argument('--design_large_networks',help='IRNet algorithm for monitoring network of large size',action='store_true')
@@ -38,9 +39,10 @@ parser.add_argument('-s','--signal_sparsity',help='Signal sparsity for basis cut
 # network design parameters
 parser.add_argument('-e','--epsilon',help='Reweighting epsilon parameter',type=float,default=1e-1,required=False)
 parser.add_argument('-n_it','--num_it',help='Number of iterations for updating monitored set',type=int,default=20,required=False)
-parser.add_argument('-vtr','--variance_threshold_ratio',help='Maximum error variance threshold for network design',type=float,default=1.1,required=False)
+#parser.add_argument('-vtr','--variance_threshold_ratio',help='Maximum error variance threshold for network design',type=float,default=1.1,required=False)
 args = parser.parse_args()
 
+#%% Classes
 # dataset class
 class LoadDataSet(ABC):
     @abstractmethod
@@ -65,7 +67,10 @@ class ImagePreprocessing(ABC):
         raise NotImplementedError
 class Windowing(ImagePreprocessing):
     """Image windowing. Maintain values within specified coordinates"""
-    def filter(self,image,lat_range:np.array,lon_range:np.array,lon_min:float,lon_max:float,lat_min:float,lat_max:float)->np.ndarray:
+    def filter(self,image,**kwargs,)->np.ndarray:
+        lat_range,lon_range = kwargs['lat_range'],kwargs['lon_range']
+        lon_min,lon_max = kwargs['lon_min'],kwargs['lon_max']
+        lat_min,lat_max = kwargs['lat_min'],kwargs['lat_max']
         idx_window_lon = np.where(np.logical_and(lon_range>=lon_min,lon_range<=lon_max))[0]
         idx_window_lat = np.where(np.logical_and(lat_range>=lat_min,lat_range<=lat_max))[0]
         image_new = image[idx_window_lat[0]:idx_window_lat[-1]+1,idx_window_lon[0]:idx_window_lon[-1]+1]
@@ -81,12 +86,34 @@ class NoPreprocessing(ImagePreprocessing):
     """ Simple No preprocessing class"""
     def filter(self,image:np.ndarray,mask:np.ndarray):
         return image,mask
+# sampling class: used for defining how many points to load from image
+class SubSampling(ABC):
+    @abstractmethod
+    def sample(self,arr,**kwargs):
+        raise NotImplementedError
+class RandomSubSampling(SubSampling):
+    """Not using all points in image but sampling random points from image"""
+    def sample(self,arr,**kwargs)->np.array:
+        n_points_sample,random_seed_subsampling = kwargs['n_points_sample'],kwargs['random_seed_subsampling']
+        n = len(arr)
+        indices = np.arange(0,n,1)
+        rng = np.random.default_rng(seed=random_seed_subsampling)    
+        indices_perm = rng.permutation(indices)
+        indices_sampled = np.sort(indices_perm[:n_points_sample])
+        arr_subsampled = arr[indices_sampled]
+        return arr_subsampled, indices_sampled
 
+class NoSubSampling(SubSampling):
+    """Select all points in image. Return all indices"""
+    def sample(self,arr,**kwargs):
+        return arr,np.arange(0,len(arr),1)
+# dataset class 
 class Dataset():
-    def __init__(self,files_path:str,loader,preprocessor,fname:str='SST_month.parquet',n_locations:int=6624):
+    def __init__(self,files_path:str,loader,preprocessor,sampler,fname:str='SST_month.parquet',n_locations:int=6624):
         self.files_path = files_path
         self._loader = loader
         self._preprocessor = preprocessor
+        self._sampler = sampler
         self.fname = fname
         self.n_locations = n_locations
 
@@ -122,16 +149,19 @@ class Dataset():
         mask = self.get_mask(rootgrp)
         data[mask] = np.nan
         data_new,mask_new = self._preprocessor.filter(data,**kwargs)
-        print(f'Scaled data has dimensions {data_new.shape}. Mask of land values has dimensions: {mask_new.shape}')
+        print(f'Preprocessed images have dimensions {data_new.shape}. Mask of land values has dimensions: {mask_new.shape}')
         # get number of samples and potential locations in preprocessed dataset
         n_samples = rootgrp.variables['sst'].shape[0]
         n_pixels = data_new.shape[0]*data_new.shape[1]
-        n_locations = n_pixels - mask_new.sum()
-        # create snapshots matrix and store first sample
-        snapshots_matrix = np.zeros(shape=(n_locations,n_samples),dtype=np.float32)
+        # reshape array of measurements and subsample some locations
         data_reshaped = np.reshape(data_new,newshape=n_pixels,order='F')
         data_reshaped = data_reshaped[~np.isnan(data_reshaped)]
-        snapshots_matrix[:,0] = data_reshaped
+        data_subsampled,indices_subsampled = self._sampler.sample(data_reshaped,**kwargs)
+        n_locations = len(data_subsampled)
+        # create snapshots matrix and store first sample
+        print(f'Creating snapshots matrix for {n_locations} locations and {n_samples} samples')
+        snapshots_matrix = np.zeros(shape=(n_locations,n_samples),dtype=np.float32)
+        snapshots_matrix[:,0] = data_subsampled
         # store other samples in snapshots matrix
         for i in np.arange(1,n_samples,1):
             data = rootgrp.variables['sst'][i].data
@@ -140,19 +170,161 @@ class Dataset():
             # drop pixels where there is land
             data_reshaped = np.reshape(data_new,newshape=n_pixels,order='F')
             data_reshaped = data_reshaped[~np.isnan(data_reshaped)]
-            snapshots_matrix[:,i] = data_reshaped
+            data_subsampled,_ = self._sampler.sample(data_reshaped,**kwargs)
+            snapshots_matrix[:,i] = data_subsampled
         
         date_range = pd.date_range(start='1981-09-01 00:00:00',freq='M',periods=n_samples)
         idx_measurement = np.where(~np.reshape(mask_new,newshape=n_pixels,order='F'))[0]
         idx_land = np.where(np.reshape(mask_new,newshape=n_pixels,order='F'))[0]
-        print(f'Number of indices with measurements: {len(idx_measurement)}\nNumber of indices with land: {len(idx_land)}\nNew dataset has {snapshots_matrix.shape[1]} measurements for {snapshots_matrix.shape[0]} locations.')
-        df = pd.DataFrame(snapshots_matrix.T,dtype=np.float32,columns=idx_measurement,index=date_range)
+        print(f'New dataset has {snapshots_matrix.shape[1]} measurements for {snapshots_matrix.shape[0]} locations.')
+        df = pd.DataFrame(snapshots_matrix.T,dtype=np.float32,columns=indices_subsampled,index=date_range)
         df.columns = df.columns.astype(str)
         return df,idx_measurement,idx_land
 
+# ROI classes: used for defining different design thresholds
+class roi_generator(ABC):
+    @abstractmethod
+    def generate_rois(self,**kwargs):
+        raise NotImplementedError
+    
+class RandomRoi(roi_generator):
+    """ Regions of Interest randomly generated from rng seed"""
+    def generate_rois(self,**kwargs)->dict:
+        seed = kwargs['seed']
+        n = kwargs['n']
+        n_regions = kwargs['n_regions']
+        rng = np.random.default_rng(seed=seed)    
+        indices = np.arange(0,n,1)
+        indices_perm = rng.permutation(indices)
+        roi_idx = {el:[] for el in np.arange(n_regions)}
+        indices_split = np.array_split(indices_perm,n_regions)
+        for i in np.arange(n_regions):
+            roi_idx[i] = indices_split[i]
+        return roi_idx
+    
+class SubSplitRandomRoi(roi_generator):
+    """
+    Regions of Interest randomly generated. 
+    The indices are randomly generated and then some of them are splitted into new sub regions.
+    """
+    def generate_rois(self,**kwargs):
+        seed = kwargs['seed']
+        n = kwargs['n']
+        n_regions_original = kwargs['n_regions_original']
+        rois_split = kwargs['rois_split']
+        n_regions_subsplit = kwargs['n_regions_subsplit']
+        seed_subsplit = kwargs['seed_subsplit']
+        rng = np.random.default_rng(seed=seed)
+        indices = np.arange(0,n,1)
+        # first split. Original ROIs
+        indices_perm = rng.permutation(indices)
+        roi_idx = {el:[] for el in np.arange(n_regions_original)}
+        indices_split = np.array_split(indices_perm,n_regions_original)
+        for i in np.arange(n_regions_original):
+            roi_idx[i] = indices_split[i]
+        # second split. Maintain some ROIs and split others
+        new_roi_idx = {}
+        rng_subsplit = np.random.default_rng(seed=seed_subsplit)
+        for i in roi_idx:
+            if i in rois_split:
+                indices_roi = roi_idx[i]
+                indices_roi_perm = rng_subsplit.permutation(indices_roi)
+                indices_roi_split = np.array_split(indices_roi_perm,n_regions_subsplit)
+                new_dict = {}
+                for j in np.arange(n_regions_subsplit):
+                    new_dict[float(f'{i}.{j+1}')] = indices_roi_split[j]
+                new_roi_idx.update(new_dict)
+            else:
+                new_roi_idx[i] = roi_idx[i]
+            
+        return new_roi_idx
+            
+    
+class VarianceRoi(roi_generator):
+    def generate_rois(self,**kwargs)->dict:
+        coordinate_error_variance_fullymonitored = kwargs['coordinate_error_variance_fullymonitored']
+        variance_thresholds = kwargs['variance_thresholds']
+        n_regions = kwargs['n_regions']
+        print(f'Determining indices that belong to each ROI. {n_regions} regions with thresholds: {variance_thresholds}')
+        if type(variance_thresholds) is not list:
+            variance_thresholds = [variance_thresholds]
+        if len(variance_thresholds) != n_regions:
+            raise ValueError(f'Number of variance thresholds: {variance_thresholds} mismatch specified number of regions: {n_regions}')
+        roi_idx = {el:[] for el in variance_thresholds}
+        for i in range(len(variance_thresholds[:-1])):
+            print(f'Variance threshold between {variance_thresholds[i]} and {variance_thresholds[i+1]}')
+            stations = [j for j in coordinate_error_variance_fullymonitored[np.logical_and(coordinate_error_variance_fullymonitored>=variance_thresholds[i],coordinate_error_variance_fullymonitored<variance_thresholds[i+1])]]
+            print(f'{len(stations)} stations')
+            idx_stations = np.where(np.isin(coordinate_error_variance_fullymonitored,stations))[0]
+            roi_idx[variance_thresholds[i]] = idx_stations
+        stations = [j for j in coordinate_error_variance_fullymonitored[coordinate_error_variance_fullymonitored>=variance_thresholds[-1]]]
+        print(f'{len(stations)} stations with a distance larger than {variance_thresholds[-1]}')
+        idx_stations = np.where(np.isin(coordinate_error_variance_fullymonitored,stations))[0]
+        roi_idx[variance_thresholds[-1]] = idx_stations
+        return roi_idx
+class ROI():
+    """
+    Region of interest (ROI) class. Select a generator from different roigenerator classes.
+    Use as:
+        roi = ROI(generator())
+        roi.deine_ROIs(**kwargs)
+    """
+    def __init__(self,generator):
+        self._generator = generator
+    def define_rois(self,**kwargs)->dict:
+        self.roi_idx = self._generator.generate_rois(**kwargs)
 
+# Reading and Writing file classes
+class FileWriter(ABC):
+    @abstractmethod
+    def save(self,**kwargs):
+        raise NotImplementedError
+class WriteRandomROIRandomSubSampling(FileWriter):
+    """ save locations file when the signal corresponds to random subsampling and was randomly splitted into differents ROIs"""
+    def save(self,results_path,n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,**kwargs):
+        random_seed_roi = kwargs['random_seed_roi']
+        random_seed_subsampling = kwargs['random_seed_subsampling']
+        fname = f'{results_path}SensorsLocations_N{n}_S{signal_sparsity}_VarThreshold{variance_threshold_ratio}_nSensors{n_locations_monitored}_randomSeed{random_seed_roi}_randomSeedSubsampling{random_seed_subsampling}.pkl'
+        with open(fname,'wb') as f:
+            pickle.dump(locations[0],f,protocol=pickle.HIGHEST_PROTOCOL)
+        print(f'File saved in {fname}')
+class FileSaver():
+    """ Save locations file generated by the network design algorithm"""
+    def __init__(self,writer):
+        self._writer = writer
+    def save(self,results_path,n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,**kwargs):
+        self._writer.save(results_path,n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,**kwargs)
 
+class FileReader(ABC):
+    @abstractmethod
+    def read(self,**kwrags):
+        raise NotImplementedError
+class ReadRandomRoiRandomSubSampling(FileReader):
+    """ Load locations file when the signal corresponds to random subsampling and was randomly splitted into different ROIs"""
+    def read(self,results_path,n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,**kwargs)->list:
+        random_seed_roi = kwargs['random_seed_roi']
+        random_seed_subsampling = kwargs['random_seed_subsampling']
+        fname = f'{results_path}SensorsLocations_N{n}_S{signal_sparsity}_VarThreshold{variance_threshold_ratio}_nSensors{n_locations_monitored}_randomSeed{random_seed_roi}_randomSeedSubsampling{random_seed_subsampling}.pkl'
+        with open(fname,'rb') as f:
+            locations_monitored = np.sort(pickle.load(f))
+        return locations_monitored
+class ReadRandomRoiRandomSubSampling_Boyd(FileReader):
+    """ Load locations file when the signal corresponds to random subsampling and was randomly splitted into different ROIs"""
+    def read(self,results_path,n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,**kwargs)->list:
+        random_seed_roi = kwargs['random_seed_roi']
+        random_seed_subsampling = kwargs['random_seed_subsampling']
+        fname = f'{results_path}SensorsLocations_Boyd_N{n}_S{signal_sparsity}_VarThreshold{variance_threshold_ratio}_nSensors{n_locations_monitored}_randomSeed{random_seed_roi}_randomSeedSubsampling{random_seed_subsampling}.pkl'
+        with open(fname,'rb') as f:
+            locations_monitored = np.sort(pickle.load(f))
+        return locations_monitored
 
+class FileLoader():
+    def __init__(self,reader):
+        self._reader = reader
+    def load(self,results_path,n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,**kwargs)->list:
+        locations_monitored = self._reader.read(results_path,n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,**kwargs)
+        return locations_monitored
+#%% Function
 # recover map
 def recover_map(y:np.array,idx_nan:np.array,n_rows:int,n_cols:int)->np.ndarray:
     """
@@ -349,35 +521,250 @@ def signal_reconstruction_regression(Psi:np.ndarray,locations_measured:np.ndarra
     """
     return rmse, error_variance
 
-def hourly_signal_reconstruction(Psi:np.ndarray,X_train:pd.DataFrame,X_val:pd.DataFrame,signal_sparsity:int=1,locations_measured:np.ndarray=[])->dict:
-    """
-    Compute reconstruction error at different times using low-rank basis
-    Args:
-        Psi (np.ndarray): monitored low-rank basis
-        X_train (pd.DataFrame): training set measurements 
-        X_val (pd.DataFrame): validation set measurements
-        signal_sparsity (int): sparsity threshold
-        locations_measured (np.ndarray): indices of monitored locations
+# Network design algorithm classes
+class NetworkDesign(ABC):
+    @abstractmethod
+    def design(self,**kwargs):
+        raise NotImplementedError
+class NetworkDesignCVXPY(NetworkDesign):
+    def design(self,sensor_placement:sp.SensorPlacement,Psi:np.ndarray,deployed_network_variance_threshold:float,epsilon:float,h_prev:np.ndarray,weights:np.ndarray,n_it:int,locations_monitored:list=[],locations_unmonitored:list=[])->list:
+        """
+        IRL1 network planning iteration implemented using cvxpy library
+        Args:
+            sensor_placement (sp.SensorPlacement): sensor placement object containing network information
+            N (int): total number of network locations
+            deployed_network_variance_threshold (float): error variance threshold for network design
+            epsilon (float): IRL1 weights update constant
+            h_prev (np.ndarray): network locations initialization
+            weights (np.ndarray): IRL1 weights initialization
+            n_it (int): IRL1 max iterations
+            locations_monitored (list, optional): initialization of set of monitored lcoations. Defaults to [].
+            locations_unmonitored (list, optional): initialization of set of unmonitored locaitons. Defaults to [].
 
-    Returns:
-        dict: rmse for multiple measurements at different times
-    """
-    hours_range = np.sort(X_train.index.hour.unique())
-    rmse_time = {el:[] for el in hours_range}
-    for h in hours_range:
-        # get measurements at certain hour and rearrange as snapshots matrix
-        X_train_hour = X_train.loc[X_train.index.hour == h]
-        X_val_hour = X_val.loc[X_val.index.hour==h]
-        snapshots_matrix_train_hour = X_train_hour.to_numpy().T
-        snapshots_matrix_train_hour_centered = snapshots_matrix_train_hour - snapshots_matrix_train_hour.mean(axis=1)[:,None]
-        snapshots_matrix_val_hour = X_val_hour.to_numpy().T
-        snapshots_matrix_val_hour_centered = snapshots_matrix_val_hour - snapshots_matrix_val_hour.mean(axis=1)[:,None]
-        if len(locations_measured) != 0:
-            rmse_hour = signal_reconstruction_regression(Psi,locations_measured,snapshots_matrix_train_hour,snapshots_matrix_val_hour_centered,X_val_hour)
-        else:# not using sensor placement procedure. Use simple svd reconstruction
-            rmse_hour = signal_reconstruction_svd(Psi,snapshots_matrix_train_hour,snapshots_matrix_val_hour_centered,X_val_hour,[signal_sparsity])
-        rmse_time[h] = rmse_hour
-    return rmse_time
+        Returns:
+            locations (list): indices of monitored and unmonitored locations [S,Sc]
+        """
+        # iterative method
+        it = 0
+        time_init = time.time()
+        new_monitored = []
+        new_unmonitored = []
+        while len(locations_monitored) + len(locations_unmonitored) != sensor_placement.n:
+            # solve sensor placement with constraints
+            
+            sensor_placement.initialize_problem(Psi,rho=deployed_network_variance_threshold,
+                                                w=weights,locations_monitored=locations_monitored,locations_unmonitored=locations_unmonitored)
+            sensor_placement.solve()
+            print(f'Problem status: {sensor_placement.problem.status}')
+            if sensor_placement.problem.status == 'optimal':
+                # update sets with new monitored locations
+                new_monitored = [i[0] for i in np.argwhere(sensor_placement.h.value >= 1-epsilon) if i[0] not in locations_monitored]
+                new_unmonitored = [i[0] for i in np.argwhere(sensor_placement.h.value <= epsilon) if i[0] not in locations_unmonitored]
+
+                locations_monitored += new_monitored
+                locations_unmonitored += new_unmonitored
+                # check convergence
+                if np.linalg.norm(sensor_placement.h.value - h_prev)<=epsilon or it==n_it:
+                    locations_monitored += [[i for i in np.argsort(sensor_placement.h.value)[::-1] if i not in locations_monitored][0]]
+                    it = 0
+                h_prev = sensor_placement.h.value
+                weights_old = weights.copy()
+                weights = 1/(h_prev + epsilon)
+                it +=1
+            else:
+                # solver fails at iteration
+                #locations_monitored = locations_monitored[:-len(new_monitored)]
+                if len(new_unmonitored) != 0:
+                    locations_unmonitored = locations_unmonitored[:-len(new_unmonitored)]
+                    weights = weights_old
+                it+=1
+
+            print(f'{len(locations_monitored)} Locations monitored: {locations_monitored}\n{len(locations_unmonitored)} Locations unmonitored: {locations_unmonitored}\n')
+            sys.stdout.flush()
+        time_end = time.time()
+        locations = [locations_monitored,locations_unmonitored]
+        print(f'IRL1 algorithm finished in {time_end-time_init:.2f}s.')
+        return locations
+    
+class NetworkDesignCVXOPT(NetworkDesign):
+    def design(self,sensor_placement:sp.SensorPlacement,Psi:np.ndarray,deployed_network_variance_threshold:float,epsilon:float,h_prev:np.ndarray,weights:np.ndarray,n_it:int,locations_monitored:list=[],locations_unmonitored:list=[])->list:
+        """
+        IRNet network planning algorithm implemented using the cvxopt linrary
+        Args:
+            sensor_placement (sp.SensorPlacement): sensor placement object containing network information
+            Psi (np.ndarray): low-rank basis with (n_rows) locations and (n_cols) vectors/dimension
+            deployed_network_variance_threshold (float): error variance threshold for network design
+            epsilon (float): IRL1 weights update constant
+            h_prev (np.ndarray): network locations initialization
+            weights (np.ndarray): IRL1 weights initialization
+            n_it (int): IRL1 max iterations
+            locations_monitored (list, optional): initialization of set of monitored lcoations. Defaults to [].
+            locations_unmonitored (list, optional): initialization of set of unmonitored locaitons. Defaults to [].
+
+        Returns:
+            locations (list): indices of monitored and unmonitored locations [S,Sc]
+        """
+        # iterative method
+        epsilon_zero = epsilon/10
+        primal_start = {'x':[],'sl':[],'ss':[]}
+        it = 0
+        time_init = time.time()
+        
+        while len(locations_monitored) + len(locations_unmonitored) != sensor_placement.n:
+            # solve sensor placement with constraints
+            sensor_placement.initialize_problem(Psi,rho=deployed_network_variance_threshold,w=weights,epsilon=epsilon,
+                                            locations_monitored=locations_monitored,locations_unmonitored = locations_unmonitored,
+                                            primal_start=primal_start)
+            sys.stdout.flush()
+            if sensor_placement.problem['status'] == 'optimal':
+                # get solution
+                primal_start['x'] = sensor_placement.problem['x']
+                primal_start['sl'] = sensor_placement.problem['sl']
+                primal_start['ss'] = sensor_placement.problem['ss']
+                # update sets
+                new_monitored = [int(i[0]) for i in np.argwhere(sensor_placement.h >= 1-epsilon) if i[0] not in locations_monitored]
+                new_unmonitored = [int(i[0]) for i in np.argwhere(sensor_placement.h <= epsilon_zero) if i[0] not in locations_unmonitored]
+                locations_monitored += new_monitored
+                locations_unmonitored += new_unmonitored
+                # check convergence
+                if np.linalg.norm(sensor_placement.h - h_prev)<=epsilon or it==n_it:
+                    locations_monitored += [[int(i[0]) for i in np.argsort(sensor_placement.h,axis=0)[::-1] if i not in locations_monitored][0]]
+                    it = 0        
+                h_prev = sensor_placement.h
+                weights = 1/(h_prev + epsilon)
+                it +=1
+                print(f'Iteration results\n ->Primal objective: {sensor_placement.problem["primal objective"]:.6f}\n ->{len(locations_monitored) + len(locations_unmonitored)} locations assigned\n ->{len(locations_monitored)} monitored locations\n ->{len(locations_unmonitored)} unmonitored locations\n')
+                sys.stdout.flush()
+            else:
+                # solver fails at iteration
+                locations_monitored = locations_monitored[:-len(new_monitored)]
+                locations_unmonitored = locations_unmonitored[:-len(new_unmonitored)]
+                it+=1
+
+
+        time_end = time.time()
+        locations = [locations_monitored,locations_unmonitored]
+        print(f'IRL1 algorithm finished in {time_end-time_init:.2f}s.')
+        sys.stdout.flush()
+        return locations
+
+class NetworkDesignIterativeCVXOPT(NetworkDesign):
+    def design(self,dataset,Psi:np.ndarray,variance_threshold_ratio:float,epsilon:float,n_it:int,locaitons_forbidden:list=[])->list:
+        """
+        IRNet network planning algorithm for large monitoring network using Regions of Interest (ROIs) and forbidden locations
+        Args:
+            dataset : loaded dataset containing coordinates and snapshots matrix
+            Psi (np.ndarray): low-rank basis with (n_rows) locations and (n_cols) vectors/dimension
+            variance_threshold_ratio (float): percentage of worsening of coordinate error variance with respect to fully monitored network
+            epsilon (float): IRL1 weights update constant
+            n_it (int): IRL1 max iterations
+            locations_forbidden (list,optional): set of indices of locations where a sensor cannot be deployed
+
+        Returns:
+            locations (list): indices of monitored and unmonitored locations [S,Sc]
+        """
+        algorithm = 'IRNet_ROI'#['IRNet_ROI','NetworkPlanning_iterative_LMI','IRL1ND']
+        # Define ROIs size
+        lat_min,lat_max = -90,90
+        lon_min,lon_max = 0,360
+        delta_lat = 5
+        delta_lon = 5
+        
+        locations_monitored = []
+        locations_unmonitored = []
+        locations_monitored_roi = []
+        locations_unmonitored_roi = []
+        
+        time_init = time.time()
+        idx_roi = np.array([],dtype=int)
+        for latitude in np.arange(lat_min,lat_max,delta_lat):
+            for longitude in np.arange(lon_min,lon_max,delta_lon):
+                # get entries of original (large) basis matrix that belong to ROI
+                idx_roi_new = define_ROI(dataset,lat_min=latitude,lat_max=latitude+delta_lat,lon_min=longitude,lon_max=longitude+delta_lon)
+                print(f'Longitude: {longitude} - Latitude: {latitude}')
+                print(f'Number of new elements in ROI: {len(idx_roi_new)}')
+                if len(idx_roi_new) == 0:
+                    continue
+                # joint new indices to previous ROI indices
+                idx_roi = np.sort(np.unique(np.concatenate((idx_roi,idx_roi_new),axis=0,dtype=np.int64)))
+                Psi_roi = Psi[idx_roi,:]
+                fully_monitored_network_max_variance_roi = da.diagonal(da.matmul(Psi_roi,Psi_roi.T)).max()
+                fully_monitored_network_max_variance_roi = fully_monitored_network_max_variance_roi.compute()
+                deployed_network_variance_threshold_roi = variance_threshold_ratio*fully_monitored_network_max_variance_roi
+                n_roi = Psi_roi.shape[0]
+                print(f'Size of ROI: {n_roi}')
+                sys.stdout.flush()
+                Psi_roi = Psi_roi.compute()
+
+                # IRNet method parameters
+                sensor_placement = sp.SensorPlacement(algorithm,n_roi,args.signal_sparsity,n_refst=n_roi,n_lcs=0,n_unmonitored=0)
+                epsilon_zero = epsilon/10
+                primal_start_roi = {'x':[],'sl':[],'ss':[]}
+                it_roi = 0
+                h_prev_roi = np.zeros(n_roi)
+                weights_roi = 1/(h_prev_roi+args.epsilon)
+                # carry monitored locations from previous ROI step
+                if len(locations_monitored)!=0:
+                    locations_monitored_roi = np.where(np.isin(idx_roi,locations_monitored))[0]
+                else:
+                    locations_monitored_roi = []
+                if len(locations_unmonitored)!=0:
+                    locations_unmonitored_roi = np.where(np.isin(idx_roi,locations_unmonitored_roi))[0]
+                else:
+                    locations_unmonitored_roi = []
+                
+                new_monitored_roi = []
+                new_unmonitored_roi = []
+
+                # begin IRNet iterations
+                while len(locations_monitored_roi) + len(locations_unmonitored_roi) != n_roi:
+                    # solve sensor placement with constraints
+                    sensor_placement.initialize_problem(Psi_roi,rho=deployed_network_variance_threshold_roi,w=weights_roi,epsilon=epsilon,
+                                                    locations_monitored=locations_monitored_roi,locations_unmonitored = locations_unmonitored_roi,
+                                                    primal_start=primal_start_roi,include_sparsity_constraint=False)
+                    
+                    if sensor_placement.problem['status'] == 'optimal':
+                        # get solution dictionary
+                        primal_start_roi['x'] = sensor_placement.problem['x']
+                        primal_start_roi['sl'] = sensor_placement.problem['sl']
+                        primal_start_roi['ss'] = sensor_placement.problem['ss']
+                        # update sets: get entries (from constrained basis) of monitored and unmonitored locations
+                        new_monitored_roi = [int(i[0]) for i in np.argwhere(sensor_placement.h >= 1-epsilon) if i[0] not in locations_monitored_roi]
+                        new_unmonitored_roi = [int(i[0]) for i in np.argwhere(sensor_placement.h <= epsilon_zero) if i[0] not in locations_unmonitored_roi]
+                        locations_monitored_roi += new_monitored_roi
+                        locations_unmonitored_roi += new_unmonitored_roi
+                        # check convergence: update entries of monitored locations
+                        if np.linalg.norm(sensor_placement.h - h_prev_roi)<=epsilon or it_roi==n_it:
+                            locations_monitored_roi += [[int(i[0]) for i in np.argsort(sensor_placement.h,axis=0)[::-1] if i not in locations_monitored_roi][0]]
+                            it_roi = 0        
+                        h_prev_roi = sensor_placement.h
+                        weights_roi = 1/(h_prev_roi + epsilon)
+                        it_roi +=1
+                        print(f'Iteration results\n ->Primal objective: {sensor_placement.problem["primal objective"]:.6f}\n ->{len(locations_monitored_roi) + len(locations_unmonitored_roi)} locations assigned\n ->{len(locations_monitored_roi)} monitored locations\n ->{len(locations_unmonitored_roi)} unmonitored locations\n')
+                        sys.stdout.flush()
+                    
+                    else:
+                        # solver fails at iteration
+                        #locations_monitored = locations_monitored[:-len(new_monitored)]
+                        locations_unmonitored_roi = locations_unmonitored_roi[:-len(new_unmonitored_roi)]
+                        it_roi+=1
+                
+                # add monitored locations from ROI to list of overall monitored locations of original basis entries
+                locations_monitored += list(idx_roi[locations_monitored_roi])
+                locations_unmonitored += list(idx_roi[locations_unmonitored_roi])
+        time_end = time.time()
+
+        locations = [locations_monitored,locations_unmonitored]
+        print(f'IRNet algorithm finished in {time_end-time_init:.2f}s.')
+        return locations
+
+class IRNET():
+    def __init__(self,algorithm):
+        self._algorithm = algorithm
+    def design_network(self,**kwargs)->list:
+        locations = self._algorithm.design(**kwargs)
+        return locations
+    
 
 def networkPlanning_iterative(sensor_placement:sp.SensorPlacement,Psi:np.ndarray,deployed_network_variance_threshold:float,epsilon:float,h_prev:np.ndarray,weights:np.ndarray,n_it:int,locations_monitored:list=[],locations_unmonitored:list=[])->list:
     """
@@ -887,51 +1274,99 @@ class Figures():
             fig.savefig(fname,dpi=300,format='png')
             print(f'Figure saved at {fname}')
     
-    def curve_errorvariance_comparison(self,errorvar_fullymonitored:list,errorvar_reconstruction:list,variance_threshold_ratio:float,worst_coordinate_variance_fullymonitored:float,n:int,n_sensors:int,errorvar_reconstruction_Dopt:list=[],save_fig:bool=False) -> plt.figure:
+    def curve_errorvariance_comparison(self,errorvar_fullymonitored:list,errorvar_reconstruction:list,variance_threshold_ratio:float,worst_coordinate_variance_fullymonitored:float,n:int,n_sensors:int,errorvar_reconstruction_Dopt:list=[],roi_idx:dict={},n_sensors_Dopt:int=0,N=0,signal_sparsity=0,save_fig:bool=False) -> plt.figure:
         """
-        Show error variance over a testing set vs network locations (n). 
+        Show error variance over a testing set at each network location. 
         The error variance is obtained after reconstructing the signal from p measurements.
-        The p measurement locations are obtained from IRL1ND algorithm.
-        It also shows the threshold line which the IRL1ND algorithm used.
+        The p measurement locations are obtained from network design algorithm or D-optimality criteria.
+        It also shows the threshold line which the network design algorithm used.
         Another algorithm can be shown for comparison.
 
         Args:
-            errorvar_fullymonitored (list): error variance at each network location obtained with a fully monitored network
-            errorvar_reconstruction (list): error variance at each network locations obtained with a network with a reduced number of deployed sensors
-            variance_threshold_ratio (float): variance threshold ratio used for design algorithm
+            errorvar_fullymonitored (list): error variance at each network location obtained with a fully monitored network. This corresponds to the lowest error variance possible.
+            errorvar_reconstruction (list): error variance at each network locations obtained with a network with a reduced number of deployed sensors.
+            variance_threshold_ratio (float): variance threshold ratio used for design algorithm. It is a multiple of the worst_coordinate_variance_fullymonitored.
             worst_coordinate_variance_fullymonitored (float): fully-monitored network worst coordinate error variance
             n (int): total number of network points
             n_sensors (int): number of deployed sensors
+            errorvar_reconstruction_Dopt (list): error variance at each network location obtained by D-optimality (or other) criteria. Defaults to [].
+            roi_idx (dict): dictionary containing indices of locations that belong to each ROI. The keys indicate the threshold used to separate the network.
             save_fig (bool, optional): Save generated figure. Defaults to False.
 
         Returns:
             plt.figure: Figure with error variance curves
         """
-        variance_threshold = variance_threshold_ratio*worst_coordinate_variance_fullymonitored
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        ax.plot(errorvar_fullymonitored,color='#1d8348',label='Fully monitored network')
-        if len(errorvar_reconstruction_Dopt) !=0:
-            ax.plot(errorvar_reconstruction_Dopt,color='orange',label=f'logdet solution',alpha=0.8)
-        ax.plot(errorvar_reconstruction,color='#1a5276',label=f'IRL1ND solution')
-        ax.hlines(y=variance_threshold,xmin=0,xmax=n+1,color='k',linestyles='--',label=rf'Design threshold $\rho$={variance_threshold_ratio:.2f}$\rho_n$')
-        xrange = np.arange(-1,n,10)
-        xrange[0] = 0
-        ax.set_xticks(xrange)
-        ax.set_xticklabels([i+1 for i in ax.get_xticks()])
-        ax.set_xlim(0,n)
-        ax.set_xlabel('Location index')
-        yrange = np.arange(0,1.75,0.25)
-        ax.set_yticks(yrange)
-        ax.set_yticklabels([np.round(i,2) for i in ax.get_yticks()])
-        ax.set_ylim(0,1.5)
-        ax.set_ylabel('Error variance')
-        ax.legend(loc='center',ncol=2,framealpha=0.5,bbox_to_anchor=(0.5,1.1))
-        fig.tight_layout()
-        if save_fig:
-            fname = f'{self.save_path}Curve_errorVariance_Threshold{variance_threshold_ratio:.2f}_Nsensors{n_sensors}.png'
-            fig.savefig(fname,dpi=300,format='png')
-            print(f'Figure saved at {fname}')
+
+        # Plot for a single design threshold over the whole network
+        if type(variance_threshold_ratio) is float or len(variance_threshold_ratio) == 1:
+            variance_threshold = variance_threshold_ratio*worst_coordinate_variance_fullymonitored
+        
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            ax.plot(errorvar_fullymonitored,color='#1d8348',label='Fully monitored network')
+            if len(errorvar_reconstruction_Dopt) !=0:
+                ax.plot(errorvar_reconstruction_Dopt,color='orange',label=f'Joshi-Boyd solution',alpha=0.8)
+            ax.plot(errorvar_reconstruction,color='#1a5276',label=f'Network design solution')
+            ax.hlines(y=variance_threshold,xmin=0,xmax=n+1,color='k',linestyles='--',label=rf'Design threshold $\rho$={variance_threshold_ratio:.2f}$\rho_n$')
+            xrange = np.arange(-1,n,10)
+            xrange[0] = 0
+            ax.set_xticks(xrange)
+            ax.set_xticklabels([i+1 for i in ax.get_xticks()])
+            ax.set_xlim(0,n)
+            ax.set_xlabel('Location index')
+            yrange = np.arange(0,1.75,0.25)
+            ax.set_yticks(yrange)
+            ax.set_yticklabels([np.round(i,2) for i in ax.get_yticks()])
+            ax.set_ylim(0,1.5)
+            ax.set_ylabel('Error variance')
+            ax.legend(loc='center',ncol=2,framealpha=0.5,bbox_to_anchor=(0.5,1.1))
+            fig.tight_layout()
+            if save_fig:
+                fname = f'{self.save_path}Curve_errorVariance_N{n}_S{signal_sparsity}_Threshold{variance_threshold_ratio:.2f}_Nsensors{n_sensors}.png'
+                fig.savefig(fname,dpi=300,format='png')
+                print(f'Figure saved at {fname}')
+
+        # Plot for different design thresholds for different ROIs
+        else:
+            variance_threshold = [t*w for t,w in zip(variance_threshold_ratio,worst_coordinate_variance_fullymonitored)]
+            # sort coordinate error variance such that the ROIs are shown in order
+            coordinate_error_variance_fully_monitored_sorted = np.concatenate([errorvar_fullymonitored[i] for i in roi_idx.values()])
+            coordinate_error_variance_design_sorted = np.concatenate([errorvar_reconstruction[i] for i in roi_idx.values()])
+
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            # coordinate error variance at each location
+            ax.plot(coordinate_error_variance_fully_monitored_sorted,color='#943126',label='Fully monitored network')
+            if len(errorvar_reconstruction_Dopt) !=0:
+                coordinate_error_variance_Dopt_sorted = np.concatenate([errorvar_reconstruction_Dopt[i] for i in roi_idx.values()])
+                ax.plot(coordinate_error_variance_Dopt_sorted,color='orange',label=f'Joshi-Boyd {n_sensors_Dopt} sensors',alpha=0.8)
+            ax.plot(coordinate_error_variance_design_sorted,color='#1a5276',label=f'Network design {n_sensors} sensors')
+            
+            # horizontal lines showing threshold design
+            n_roi = np.concatenate([[0],[len(i) for i in roi_idx.values()]])
+            n_roi_cumsum = np.cumsum(n_roi)
+            for v,l in zip(variance_threshold,range(len(n_roi_cumsum))):
+                if l==0:
+                    ax.hlines(y=v,xmin=n_roi_cumsum[l]-1,xmax=n_roi_cumsum[l+1]-1,color='k',linestyles='--',label='Design threshold')
+                else:
+                    ax.hlines(y=v,xmin=n_roi_cumsum[l],xmax=n_roi_cumsum[l+1]-1,color='k',linestyles='--')
+            xrange = np.arange(-1,n,10)
+            xrange[0] = 0
+            ax.set_xticks(xrange)
+            ax.set_xticklabels([i+1 for i in ax.get_xticks()])
+            ax.set_xlim(-0.5,n)
+            ax.set_xlabel('Location index')
+            yrange = np.arange(0,3.5,0.5)
+            ax.set_yticks(yrange)
+            ax.set_yticklabels([np.round(i,2) for i in ax.get_yticks()])
+            ax.set_ylim(0,3.0+0.1)
+            ax.set_ylabel('Coordinate error variance')
+            ax.legend(loc='center',ncol=2,framealpha=0.5,bbox_to_anchor=(0.5,1.1))
+            fig.tight_layout()
+            if save_fig:
+                fname = f'{self.save_path}Curve_SST_errorVariance_N{n}_S{signal_sparsity}_VarThreshold{variance_threshold_ratio}_Nsensors{n_sensors}_NsensorsDopt{n_sensors_Dopt}.png'
+                fig.savefig(fname,dpi=300,format='png')
+                print(f'Figure saved at {fname}')
 
     def curve_rmse_hourly(self,rmse_time,month=0,save_fig=False):
         hours = [i for i in rmse_time.keys()]
@@ -962,23 +1397,28 @@ if __name__ == '__main__':
     abs_path = os.path.dirname(os.path.realpath(__file__))
     files_path = os.path.abspath(os.path.join(abs_path,os.pardir)) + '/files/'
     results_path = os.path.abspath(os.path.join(abs_path,os.pardir)) + '/test/'    
-    dataset = Dataset(files_path,LoadGRP(),Windowing())
+    dataset = Dataset(files_path,LoadGRP(),Windowing(),RandomSubSampling())
     rootgrp = dataset._loader.load(files_path,fname='sst.mon.mean.nc')
     lat_range,lon_range = dataset.get_coordinates(rootgrp)
     # windowing to certain ocean area: El Nino coordinates
-    lat_min,lat_max = -5,5
-    lon_min,lon_max = 190,240
+    lat_min,lat_max = -5,5#-5,5
+    lon_min,lon_max = 190,240 #190,240
+    n_points_subsampling = 200
+    random_seed_subsampling = 0
     df,idx_measurements,idx_land = dataset.create_dataframe(rootgrp,lat_range=lat_range,lon_range=lon_range,
-                                  lon_min=lon_min,lon_max=lon_max,lat_min=lat_min,lat_max=lat_max)
-    map_recovered = recover_map(df.iloc[0,:],idx_land,n_rows=int(4*np.abs(lat_min - lat_max)),n_cols=int(4*np.abs(lon_max - lon_min)))
-    
-    train_ratio = 0.75
-    validation_ratio = 0.15
-    test_ratio = 0.10
+                                                            lon_min=lon_min,lon_max=lon_max,lat_min=lat_min,lat_max=lat_max,
+                                                            n_points_sample=n_points_subsampling,random_seed_subsampling=random_seed_subsampling)
+    print(df.head())
+    # map_recovered = recover_map(df.iloc[0,:],idx_land,n_rows=int(4*np.abs(lat_min - lat_max)),n_cols=int(4*np.abs(lon_max - lon_min)))
 
+    
     """ Get signal sparsity via SVD decomposition"""
 
     if args.determine_sparsity:
+        train_ratio = 0.75
+        validation_ratio = 0.15
+        test_ratio = 0.10
+
         # low-rank decomposition of snapshots matrix
         print('Preparing snapshots matrix')
         X_train, X_test = train_test_split(dataset.df, test_size= 1 - train_ratio,shuffle=False,random_state=92)
@@ -1037,52 +1477,99 @@ if __name__ == '__main__':
             - the number of deployed sensors is unknown a priori
     """
     if args.design_network:
-        # low-rank decomposition
-        X_train, X_test = train_test_split(dataset.df, test_size= 1 - train_ratio,shuffle=False,random_state=92)
-        snapshots_matrix_train = da.array(X_train.to_numpy().T)
-        mean_values = snapshots_matrix_train.mean(axis=1)[:,None]
-        U,sing_vals,Vt = da.linalg.svd(snapshots_matrix_train - mean_values)
-        # specify signal sparsity
-        Psi = U[:,:args.signal_sparsity]        
-        n = Psi.shape[0]
-        # initialize algorithm
-        fully_monitored_network_max_variance = da.diagonal(da.matmul(Psi,Psi.T)).max()
+        # dataset split
+        train_ratio = 0.75
+        validation_ratio = 0.15
+        test_ratio = 0.10
+        X_train, X_test = train_test_split(df, test_size= 1 - train_ratio,shuffle=False,random_state=92)
+        X_val, X_test = train_test_split(X_test, test_size=test_ratio/(test_ratio + validation_ratio),shuffle=False,random_state=92) 
         
-        fully_monitored_network_max_variance = fully_monitored_network_max_variance.compute()
-        Psi = Psi.compute()
-        del U, snapshots_matrix_train, X_train
+        # low-rank decomposition
+        snapshots_matrix_train = X_train.to_numpy().T
+        snapshots_matrix_val = X_val.to_numpy().T
+        snapshots_matrix_test = X_test.to_numpy().T
+        snapshots_matrix_train_centered = snapshots_matrix_train - snapshots_matrix_train.mean(axis=1)[:,None]
+        snapshots_matrix_val_centered = snapshots_matrix_val - snapshots_matrix_train.mean(axis=1)[:,None]
+        snapshots_matrix_test_centered = snapshots_matrix_test - snapshots_matrix_train.mean(axis=1)[:,None]
+        U,sing_vals,Vt = np.linalg.svd(snapshots_matrix_train_centered,full_matrices=False)
+        print(f'Training snapshots matrix has dimensions {snapshots_matrix_train_centered.shape}.\nLeft singular vectors matrix has dimensions {U.shape}\nRight singular vectors matrix has dimensions {Vt.shape}\nNumber of singular values: {sing_vals.shape}')
+        cumulative_energy = np.cumsum(sing_vals)/np.sum(sing_vals)
+        energy_threshold = 0.9
+        signal_sparsity = np.where(cumulative_energy>=energy_threshold)[0][0]
+        print(f'Energy threshold of {energy_threshold} reached at singular at singular value index: {signal_sparsity}')
+        Psi = U[:,:signal_sparsity]
+        n = Psi.shape[0]
+        print(f'Basis shape: {Psi.shape}')
+        sys.stdout.flush()
+        # define regions with different threshold desings
+        random_seed = 0
+        roi = ROI(RandomRoi())
+        roi.define_rois(seed=random_seed,n=n,n_regions=2)
+        roi_idx = roi.roi_idx
+        roi_threshold,n_regions = [i for i in roi_idx.keys()],len(roi_idx)
+        
+        # coordiante error variance
+        coordinate_error_variance_fullymonitored = np.diag(Psi@Psi.T)
+        maxvariance_fullymonitored = coordinate_error_variance_fullymonitored.max()
+        maxvariance_fullymonitored_ROI = [np.max(coordinate_error_variance_fullymonitored[i]) for i in roi_idx.values()]
+        variance_threshold_ratio = [1.5,2.0]
+        if len(variance_threshold_ratio) != n_regions:
+            raise ValueError(f'Number of user-defined thresholds ({len(variance_threshold_ratio)}) mismatch number of ROIs ({n_regions})')
+        print(f'- Number of ROIs: {n_regions}.\n- Thresholds: {roi_threshold}\n- Number of elements in each ROI: {[len(i) for i in roi_idx.values()]}\n- max variance threshold ratio: {variance_threshold_ratio}')
+        sys.stdout.flush()
+        # algorithm parameters        
+        deployed_network_variance_threshold = np.zeros(shape=n)
+        for f,v,idx in zip(variance_threshold_ratio,maxvariance_fullymonitored_ROI,roi_idx.values()):
+            np.put(deployed_network_variance_threshold,idx,f*v)
 
-        deployed_network_variance_threshold = args.variance_threshold_ratio*fully_monitored_network_max_variance
-        algorithm = 'IRL1ND'#['NetworkPlanning_iterative_LMI','IRL1ND']
-        sensor_placement = sp.SensorPlacement(algorithm, n, args.signal_sparsity,
-                                              n_refst=n,n_lcs=0,n_unmonitored=0)
-        # algorithm parameters
         h_prev = np.zeros(n)
-        w = 1/(h_prev+args.epsilon)
+        weights = 1/(h_prev+args.epsilon)
         locations_monitored = []
         locations_unmonitored = []
-        print(f'Iterative network planning algorithm.\n Parameters:\n -Basis shape: {Psi.shape}\n -Max variance threshold ratio: {args.variance_threshold_ratio:.2f}\n -epsilon: {args.epsilon:.1e}\n -number of convergence iterations: {args.num_it}')
-        locations = networkPlanning_iterative(sensor_placement,Psi,deployed_network_variance_threshold,
-                                              epsilon=args.epsilon,h_prev=h_prev,weights=w,n_it=args.num_it,
-                                              locations_monitored=locations_monitored,locations_unmonitored=locations_unmonitored)
         
+        """ Network design algorithm: depending on the algorithm indicated changes the class for IRNET"""
+        algorithm = 'IRL1ND'#['NetworkPlanning_iterative','NetworkPlanning_iterative_LMI','IRL1ND']
+        sensor_placement = sp.SensorPlacement(algorithm, n, signal_sparsity,
+                                              n_refst=n,n_lcs=0,n_unmonitored=0)
+        network_design = IRNET(NetworkDesignCVXOPT())#[IRNET(NetworkDesignCVXPY()),IRNET(NetworkDesignCVXOPT())]
+        locations = network_design.design_network(sensor_placement=sensor_placement,Psi=Psi,deployed_network_variance_threshold=deployed_network_variance_threshold,
+                                                  epsilon=args.epsilon,h_prev=h_prev,weights=weights,n_it=args.num_it,
+                                                  locations_monitored=locations_monitored,locations_unmonitored=locations_unmonitored)
+        
+        print(f'Iterative network planning algorithm.\n Parameters:\n -Max variance threshold ratio: {variance_threshold_ratio}\n -epsilon: {args.epsilon:.1e}\n -number of convergence iterations: {args.num_it}')
+        """
+        locations = networkPlanning_iterative(sensor_placement,Psi,deployed_network_variance_threshold,
+                                              epsilon=args.epsilon,h_prev=h_prev,weights=weights,n_it=args.num_it,
+                                              locations_monitored=locations_monitored,locations_unmonitored=locations_unmonitored)
+        """
         # deploy sensors and compute variance
         sensor_placement.locations = [[],np.sort(locations[0]),np.sort(locations[1])]
         sensor_placement.C_matrix()
         worst_coordinate_variance = np.diag(Psi@np.linalg.inv(Psi.T@sensor_placement.C[1].T@sensor_placement.C[1]@Psi)@Psi.T).max()
+        worst_coordinate_variance_ROIs = np.diag(Psi@np.linalg.inv(Psi.T@sensor_placement.C[1].T@sensor_placement.C[1]@Psi)@Psi.T)
         n_locations_monitored = len(locations[0])
         n_locations_unmonitored = len(locations[1])
-        print(f'Network planning results:\n- Total number of potential locations: {n}\n- basis sparsity: {signal_sparsity}\n- Fully monitored basis max variance: {fully_monitored_network_max_variance:.2f}\n- Max variance threshold: {deployed_network_variance_threshold:.2f}\n- Deployed network max variance: {worst_coordinate_variance:.2f}\n- Number of monitored locations: {n_locations_monitored}\n- Number of unmonitored locations: {n_locations_unmonitored}\n')
+        print(f'Network design results:\n- Total number of potential locations: {n}\n- basis sparsity: {signal_sparsity}\n- Number of monitored locations: {n_locations_monitored}\n- Number of unmonitored locations: {n_locations_unmonitored}')
+        print(f'- Overall fully monitored max variance: {maxvariance_fullymonitored}\n- Fully monitored max variance per ROI: {maxvariance_fullymonitored_ROI}\n- Max variance design threshold per ROI: {[np.unique(deployed_network_variance_threshold)]}\n- Overall deployed network max variance: {worst_coordinate_variance}\n- Deployed network max variance per ROI: {[np.max(worst_coordinate_variance_ROIs[i]) for i in roi_idx.values()]}')
+        sys.stdout.flush()
+        # evaluate if algorithm was successful
+        success = [ [np.max(worst_coordinate_variance_ROIs[j]) for j in roi_idx.values()][i]<variance_threshold_ratio[i]*maxvariance_fullymonitored_ROI[i] for i in range(n_regions)]
+        for i in range(n_regions):
+            if success[i]:
+                print(f'Success in deploying sensors for ROI {i}')
+            else:
+                warnings.warn(f'Region of interest {i} failed to fulfill design threshold')
+
         # save results
-        fname = f'{results_path}SensorsLocations_N{n}_S{args.signal_sparsity}_VarThreshold{args.variance_threshold_ratio:.2f}_nSensors{n_locations_monitored}.pkl'
-        with open(fname,'wb') as f:
-            pickle.dump(locations[0],f,protocol=pickle.HIGHEST_PROTOCOL)
-        print(f'File saved in {fname}')
+        if all(success):
+            file_saver = FileSaver(WriteRandomROIRandomSubSampling())
+            file_saver.save(results_path,n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,
+                            random_seed_roi=random_seed,random_seed_subsampling=random_seed_subsampling)
         sys.exit()
 
     """ IRNet method adapted for large monitoring networks (SST dataset)"""
     if args.design_large_networks:
-        print(f'Iterative network planning algorithm.\n Design parameters:\n -Max variance threshold ratio: {args.variance_threshold_ratio:.2f}\n -epsilon: {args.epsilon:.1e}\n -number of convergence iterations: {args.num_it}')
+        print(f'Iterative network planning algorithm.\n Design parameters:\n -Max variance threshold ratio: {variance_threshold_ratio}\n -epsilon: {args.epsilon:.1e}\n -number of convergence iterations: {args.num_it}')
         sys.stdout.flush()
 
         # low-rank decomposition
@@ -1129,45 +1616,16 @@ if __name__ == '__main__':
         print(f'File saved in {fname}')
         sys.exit()
 
-    """ Compare NetworkDesign results for different parameters (epsilon)"""
-    validate_epsilon = False
-    if validate_epsilon:
-        # low-rank decomposition
-        snapshots_matrix_train = X_train.to_numpy().T
-        snapshots_matrix_val = X_val.to_numpy().T
-        snapshots_matrix_test = X_test.to_numpy().T
-        snapshots_matrix_train_centered = snapshots_matrix_train - snapshots_matrix_train.mean(axis=1)[:,None]
-        snapshots_matrix_val_centered = snapshots_matrix_val - snapshots_matrix_train.mean(axis=1)[:,None]
-        snapshots_matrix_test_centered = snapshots_matrix_test - snapshots_matrix_train.mean(axis=1)[:,None]
-        U,sing_vals,Vt = np.linalg.svd(snapshots_matrix_train_centered,full_matrices=False)
-        print(f'Training snapshots matrix has dimensions {snapshots_matrix_train_centered.shape}.\nLeft singular vectors matrix has dimensions {U.shape}\nRight singular vectors matrix has dimensions [{Vt.shape}]\nNumber of singular values: {sing_vals.shape}')
-        # specify signal sparsity and network parameters
-        signal_sparsity = 28
-        Psi = U[:,:signal_sparsity]
-        n = Psi.shape[0]
-        In = np.identity(n)
-        # load moniteored locations IRL1ND results
-        epsilon_range = np.logspace(-3,-1,3)
-        variance_ratio_range = [1.01,1.05,1.1,1.2,1.3,1.4,1.5]
-        worst_coordinate_variance_epsilon = pd.DataFrame([],columns=variance_ratio_range,index=epsilon_range)
-        for var_ratio in variance_ratio_range:
-            for epsilon in epsilon_range:
-                fname = f'{results_path}NetworkDesign/epsilon{epsilon:.0e}/SensorsLocations_N{n}_S{signal_sparsity}_VarThreshold{var_ratio:.2f}.pkl'
-                try:
-                    with open(fname,'rb') as f:
-                        locations_monitored = np.sort(pickle.load(f))
-                    locations_unmonitored = [i for i in np.arange(n) if i not in locations_monitored]
-                    C = In[locations_monitored,:]
-                    worst_coordinate_variance_epsilon.loc[epsilon,var_ratio] = np.diag(Psi@np.linalg.inv(Psi.T@C.T@C@Psi)@Psi.T).max()
-                except:
-                    print(f'No file for error variance ratio {var_ratio:.2f} and epsilon {epsilon:.1e}')
-        print(f'Analytical worst coordinate error variance for different IRL1ND parameter\n{worst_coordinate_variance_epsilon}')
-        sys.exit()
-
-
     """ Reconstruct signal using measurements at certain locations and compare with actual values """
     reconstruct_signal = False
     if reconstruct_signal:
+        # dataset split
+        train_ratio = 0.75
+        validation_ratio = 0.15
+        test_ratio = 0.10
+        X_train, X_test = train_test_split(df, test_size= 1 - train_ratio,shuffle=False,random_state=92)
+        X_val, X_test = train_test_split(X_test, test_size=test_ratio/(test_ratio + validation_ratio),shuffle=False,random_state=92) 
+        
         # low-rank decomposition
         snapshots_matrix_train = X_train.to_numpy().T
         snapshots_matrix_val = X_val.to_numpy().T
@@ -1176,71 +1634,70 @@ if __name__ == '__main__':
         snapshots_matrix_val_centered = snapshots_matrix_val - snapshots_matrix_train.mean(axis=1)[:,None]
         snapshots_matrix_test_centered = snapshots_matrix_test - snapshots_matrix_train.mean(axis=1)[:,None]
         U,sing_vals,Vt = np.linalg.svd(snapshots_matrix_train_centered,full_matrices=False)
-        print(f'Training snapshots matrix has dimensions {snapshots_matrix_train_centered.shape}.\nLeft singular vectors matrix has dimensions {U.shape}\nRight singular vectors matrix has dimensions [{Vt.shape}]\nNumber of singular values: {sing_vals.shape}')
-        # specify signal sparsity and network parameters
-        signal_sparsity = 28
+        print(f'Training snapshots matrix has dimensions {snapshots_matrix_train_centered.shape}.\nLeft singular vectors matrix has dimensions {U.shape}\nRight singular vectors matrix has dimensions {Vt.shape}\nNumber of singular values: {sing_vals.shape}')
+        cumulative_energy = np.cumsum(sing_vals)/np.sum(sing_vals)
+        energy_threshold = 0.9
+        signal_sparsity = np.where(cumulative_energy>=energy_threshold)[0][0]
+        print(f'Energy threshold of {energy_threshold} reached at singular at singular value index: {signal_sparsity}')
         Psi = U[:,:signal_sparsity]
         n = Psi.shape[0]
-        epsilon = 1e-2
-        variance_threshold_ratio = 1.5
-        fully_monitored_network_max_variance = np.diag(Psi@np.linalg.inv(Psi.T@Psi)@Psi.T).max()
-        deployed_network_variance_threshold = variance_threshold_ratio*fully_monitored_network_max_variance
-        # load monitored locations indices
-        fname = f'{results_path}NetworkDesign/epsilon{epsilon:.0e}/SensorsLocations_N{n}_S{signal_sparsity}_VarThreshold{variance_threshold_ratio:.2f}.pkl'
-        with open(fname,'rb') as f:
-            locations_monitored = np.sort(pickle.load(f))
+        print(f'Basis shape: {Psi.shape}')
+        sys.stdout.flush()
+        
+        # define regions with different threshold desings
+        random_seed = 0
+        roi = ROI(RandomRoi())
+        roi.define_rois(seed=random_seed,n=n,n_regions=2)
+        roi_idx = roi.roi_idx
+        roi_threshold,n_regions = [i for i in roi_idx.keys()],len(roi_idx)
+
+        # Load locations obtained by the network design algorithm
+        variance_threshold_ratio = [1.5,2.0]
+        n_locations_monitored = 68
+        file_loader = FileLoader(ReadRandomRoiRandomSubSampling())
+        locations_monitored = file_loader.load(f'{results_path}SST/',n,signal_sparsity,variance_threshold_ratio,n_locations_monitored,
+                                               random_seed_roi=random_seed,random_seed_subsampling=random_seed_subsampling)
         locations_unmonitored = [i for i in np.arange(n) if i not in locations_monitored]
-        n_locations_monitored = len(locations_monitored)
         n_locations_unmonitored = len(locations_unmonitored)
-        print(f'Loading indices of monitored locations from: {fname}\n- Total number of potential locations: {n}\n- Number of monitored locations: {len(locations_monitored)}\n- Number of unmonitoreed locations: {len(locations_unmonitored)}')
-        # get worst variance analytically
+        print(f'- Total number of potential locations: {n}\n- Number of monitored locations: {len(locations_monitored)}\n- Number of unmonitoreed locations: {len(locations_unmonitored)}')
+                
+
+        # compute coordinate error variance
+        coordinate_error_variance_fullymonitored = np.diag(Psi@Psi.T)
+        maxvariance_fullymonitored = coordinate_error_variance_fullymonitored.max()
+        maxvariance_fullymonitored_ROI = [np.max(coordinate_error_variance_fullymonitored[i]) for i in roi_idx.values()]
+
         In = np.identity(n)
         C = In[locations_monitored,:]
-        worst_coordinate_variance_reconstruction = np.diag(Psi@np.linalg.inv(Psi.T@C.T@C@Psi)@Psi.T).max()
-        error_variance_reconstruction = np.diag(Psi@np.linalg.inv(Psi.T@C.T@C@Psi)@Psi.T)
-        error_variance_fullymonitored = np.diag(Psi@np.linalg.inv(Psi.T@Psi)@Psi.T)
-        print(f'Worst coordinate variance threshold: {deployed_network_variance_threshold:.3f}\nAnalytical Fullymonitored worst coordinate variance: {error_variance_fullymonitored.max():.3f}\nAnalytical worst coordinate variance achieved: {worst_coordinate_variance_reconstruction:.3f}')
-        # empirical signal reconstruction
-        project_signal = True
-        if project_signal:
-            X_test_proj = (Psi@Psi.T@X_test.T).T
-            X_test_proj.columns = X_test.columns
-            X_test_proj.index = X_test.index
-            X_test_proj_noisy = add_noise_signal(X_test_proj,seed=42,var=1.0)
-            rmse_reconstruction,errorvar_reconstruction = signal_reconstruction_regression(Psi,locations_monitored,X_test=X_test_proj,X_test_measurements=X_test_proj_noisy,projected_signal=True)
-            rmse_fullymonitored,errorvar_fullymonitored = signal_reconstruction_regression(Psi,np.arange(n),X_test=X_test_proj,X_test_measurements=X_test_proj_noisy,projected_signal=True)
-            
-            # reconstruction using alternative method
-            try:
-                fname = f'{results_path}Dopt/SensorsLocations_N{n}_S{signal_sparsity}_nSensors{n_locations_monitored}.pkl'
-                with open(fname,'rb') as f:
-                    locations_monitored_Dopt = np.sort(pickle.load(f))
-                locations_unmonitored_Dopt = [i for i in np.arange(n) if i not in locations_monitored_Dopt]
-                C_Dopt = In[locations_monitored_Dopt,:]
-                error_variance_Dopt = np.diag(Psi@np.linalg.inv(Psi.T@C_Dopt.T@C_Dopt@Psi)@Psi.T)
-                rmse_reconstruction_Dopt,errorvar_reconstruction_Dopt= signal_reconstruction_regression(Psi,locations_monitored_Dopt,X_test=X_test_proj,X_test_measurements=X_test_proj_noisy,projected_signal=True)
-                print(f'Loading alternative sensor placement locations obtained with Dopt method.')
-
-            except:
-                    print(f'No Dopt sensor placement file for worse error variance threshold {variance_threshold_ratio:.2f} and num sensors {n_locations_monitored}')
-                    errorvar_reconstruction_Dopt = []
-
-        else:
-            # fix before running
-            rmse_reconstruction,errormax_reconstruction = signal_reconstruction_regression(Psi,locations_monitored,
-                                                                                           snapshots_matrix_train,snapshots_matrix_test_centered,X_test)
-            rmse_fullymonitored,errormax_fullymonitored = signal_reconstruction_regression(Psi,np.arange(n),
-                                                                                           snapshots_matrix_train,snapshots_matrix_test_centered,X_test)
-        # visualize        
+        coordinate_error_variance_deployed = np.diag(Psi@np.linalg.inv(Psi.T@C.T@C@Psi)@Psi.T)
+        maxvariance_deployed = coordinate_error_variance_deployed.max()
+        maxvariance_deployed_ROI = [np.max(coordinate_error_variance_deployed[i]) for i in roi_idx.values()]
+        
+        # Load locations obtained by alternative algorithm
+        try:
+            n_locations_monitored_Boyd = 68
+            file_loader = FileLoader(ReadRandomRoiRandomSubSampling_Boyd())
+            locations_monitored_Boyd = file_loader.load(f'{results_path}SST/',n,signal_sparsity,variance_threshold_ratio,n_locations_monitored_Boyd,
+                                                        random_seed_roi=random_seed,random_seed_subsampling=random_seed_subsampling)
+            C = In[locations_monitored_Boyd,:]
+            coordinate_error_variance_Boyd = np.diag(Psi@np.linalg.inv(Psi.T@C.T@C@Psi)@Psi.T)
+            maxvariance_deployed_Boyd = coordinate_error_variance_Boyd.max()
+            maxvariance_Boyd_ROI = [np.max(coordinate_error_variance_Boyd[i]) for i in roi_idx.values()]
+        except:
+            print('No locations file for alternative method')
+            locations_monitored_Boyd = []
+            coordinate_error_variance_Boyd = []
+        
+        # visualize coordinate error variance
         plots = Figures(save_path=results_path,marker_size=1,
-            fs_label=12,fs_ticks=7,fs_legend=6,fs_title=10,
-            show_plots=True)
-        plots.geographical_network_visualization(map_path=f'{files_path}ll_autonomicas_inspire_peninbal_etrs89/',coords_path=files_path,locations_monitored=locations_monitored,show_legend=True,save_fig=False)
-        
-        plots.curve_errorvariance_comparison(errorvar_fullymonitored,errorvar_reconstruction,variance_threshold_ratio,errorvar_fullymonitored.max(),n,n_locations_monitored,errorvar_reconstruction_Dopt,save_fig=True)
-        plots.curve_errorvariance_comparison(error_variance_fullymonitored,error_variance_reconstruction,variance_threshold_ratio,error_variance_fullymonitored.max(),n,n_locations_monitored,error_variance_Dopt,save_fig=False)
+                        fs_label=8,fs_ticks=8,fs_legend=4.5,fs_title=10,
+                        show_plots=True)
+        plots.curve_errorvariance_comparison(coordinate_error_variance_fullymonitored,coordinate_error_variance_deployed,
+                                             variance_threshold_ratio,maxvariance_fullymonitored_ROI,
+                                             n,n_locations_monitored,
+                                             coordinate_error_variance_Boyd,roi_idx,n_locations_monitored_Boyd,
+                                             N=n,signal_sparsity=signal_sparsity,
+                                             save_fig=False)
 
-
-        
         plt.show()
         sys.exit()
