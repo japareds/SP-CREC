@@ -269,7 +269,7 @@ class ReadSplitRandomFileBoyd(FileReader):
         n = kwargs['n']
         signal_sparsity = kwargs['signal_sparsity']
         variance_threshold_ratio = kwargs['variance_threshold_ratio']
-        n_sensors_Dopt = kwargs['n_sensors']
+        n_sensors_Dopt = kwargs['n_sensors_Dopt']
         random_seed = kwargs['random_seed']
         seed_subsplit = kwargs['seed_subsplit']
         rois_split = kwargs['rois_split']
@@ -490,6 +490,7 @@ class Dataset():
         print(f'Percentage of missing values per location:\n{100*self.ds.isna().sum()/self.ds.shape[0]}')
         print(f'Dataset has {self.ds.shape[0]} measurements for {self.ds.shape[1]} locations.\n{self.ds.head()}')
 
+#%%
 # figures
 class Figures():
     def __init__(self,save_path,figx=2.5,figy=2.5,fs_title=10,fs_label=10,fs_ticks=10,fs_legend=10,marker_size=3,dpi=300,use_grid=False,show_plots=False):
@@ -553,7 +554,7 @@ class Figures():
         ax.set_ylabel('Concentration ($\mu$g/$m^3$)')
         fig.tight_layout()
 
-    def curve_timeseries_allstations(self,X:pd.DataFrame,date_init:str='2020-01-20',date_end:str='2021-10-27',save_fig=True):
+    def curve_timeseries_allstations(self,X:pd.DataFrame,date_init:str='2020-01-20',date_end:str='2021-10-27',save_fig=False):
         date_range = pd.date_range(start=date_init,end=date_end,freq='H')
         date_idx = [i for i in date_range if i in X.index]
         data = X.loc[date_idx]
@@ -672,7 +673,7 @@ class Figures():
 
         Args:
             map_path (str): path to map file
-            df_coordinates (pd.DataFrame): dataframe containing coordiantes(Latitude,Longitude) of each reference stations
+            df_coordinates (pd.DataFrame): dataframe containing coordiantes(Latitude,Longitude) of each reference station
             locations_monitored (np.array, optional): indices of monitored locations. Defaults to [].
             roi_idx (dict): dictionary indicating indices that belong to each region of interest (ROI) in case of heterogeneous design. The keys correspond to parameter used for separating ROIs.
             show_legend (bool, optional): Show legend indicating monitored and unmonitored locations. Defaults to False.
@@ -704,55 +705,71 @@ class Figures():
         
         try:
             if len(roi_idx)!=0:
-                markers = ['o','^']
+                markers = ['^','o','s','P','D']
                 colors = ['k','#943126']
                 if show_deployed_sensors:
-                    for idx,m in zip(roi_idx.values(),markers):
-                        
-                        locations_monitored_roi = np.array(locations_monitored)[np.isin(locations_monitored,idx)]
-
+                    print('Map showing monitored and unmonitored locations for each ROI')
+                    for i,idx,m in zip(range(len(roi_idx)),roi_idx.values(),markers):
+                        #locations_monitored_roi = np.array(locations_monitored)[np.isin(locations_monitored,idx)]
+                        locations_monitored_roi = np.array([i for i in locations_monitored if i in idx])
+                        locations_unmonitored_roi = np.array([i for i in range(df_coordinates.shape[0]) if i not in locations_monitored and i in idx])
+                        print(f'locations monitored for ROI {i}: {len(locations_monitored_roi)}\nlocations unmonitored for ROI {i}: {len(locations_unmonitored_roi)}')
+                        # monitored locations in ROI
                         df_coords_monitored = df_coordinates.iloc[[i for i in range(df_coordinates.shape[0]) if i in locations_monitored_roi]]
                         geometry_monitored = [Point(xy) for xy in zip(df_coords_monitored['Longitude'], df_coords_monitored['Latitude'])]
                         gdf_monitored = GeoDataFrame(df_coords_monitored, geometry=geometry_monitored)
-                        gdf_monitored.plot(ax=geo_map, marker=m, color='#943126', markersize=6,label=f'Monitoring node')
+                        gdf_monitored.plot(ax=geo_map, marker=m, color=colors[1], markersize=6,label=f'$\mathcal{{R}}_{i+1}{{\cap}}\mathcal{{S}}$')
                         
-                        df_coords_unmonitored = df_coordinates.iloc[[i for i in range(df_coordinates.shape[0]) if i in idx and i not in locations_monitored_roi]]
+                        # unmonitored locations in ROI
+                        df_coords_unmonitored = df_coordinates.iloc[[i for i in range(df_coordinates.shape[0]) if i in locations_unmonitored_roi]]
+                        print(f'Shape of unmonitored dataframe coordinates: {df_coords_unmonitored.shape}')
                         geometry_unmonitored = [Point(xy) for xy in zip(df_coords_unmonitored['Longitude'], df_coords_unmonitored['Latitude'])]
                         gdf_unmonitored = GeoDataFrame(df_coords_unmonitored, geometry=geometry_unmonitored)
-                        gdf_unmonitored.plot(ax=geo_map, marker=m, color='k', markersize=6,label=f'Unmonitored locations') 
-                else:
+                        gdf_unmonitored.plot(ax=geo_map, marker=m, color=colors[0], markersize=6,label=f'$\mathcal{{R}}_{i+1}{{\cap}}\mathcal{{S}}^{{c}}$') 
+
+                else: # show icons belonging to each ROI
                     for i,idx,m,c in zip(range(len(roi_idx)),roi_idx.values(),markers,colors):
                         
                         df_coords_idx = df_coordinates.iloc[[i for i in range(df_coordinates.shape[0]) if i in idx]]
                         geometry_idx = [Point(xy) for xy in zip(df_coords_idx['Longitude'], df_coords_idx['Latitude'])]
                         gdf_monitored = GeoDataFrame(df_coords_idx, geometry=geometry_idx)
-                        gdf_monitored.plot(ax=geo_map, marker=m, color=c, markersize=6,label=f'ROI$_{i+1}$')
+                        gdf_monitored.plot(ax=geo_map, marker=m, color=c, markersize=6,label=f'$\mathcal{{R}}_{i+1}$')
                 
             else:
                 gdf_monitored.plot(ax=geo_map, marker='o', color='#943126', markersize=6,label=f'Monitoring node')
                 gdf_unmonitored.plot(ax=geo_map, marker='o', color='k', markersize=6,label=f'Unmonitored locations')
         except:
-            print('No unmonitored locations')
-        ax.set_xlim(0.0,3.5)
+            warnings.warn('No unmonitored locations or unexpected error in dataframe')
+        ax.set_xlim(0.0,4.0)
         ax.set_ylim(40.5,43)
         
         ax.set_ylabel('Latitude (degrees)')
         ax.set_xlabel('Longitude (degrees)')
 
+        # set legend location
         if show_legend:
             if show_deployed_sensors:
-                ax.legend(loc='center',ncol=2,framealpha=1,bbox_to_anchor=(0.5,1.2))
+                if len(roi_idx) == 2:
+                    ax.legend(loc='center',ncol=len(roi_idx),framealpha=0,
+                              handletextpad=-0.8,columnspacing=5e-4,labelspacing=0.1,bbox_to_anchor=(0.73,0.1))
+                elif len(roi_idx)==3:
+                    ax.legend(loc='center',ncol=len(roi_idx),framealpha=0,
+                              handletextpad=-0.8,columnspacing=1e-6,labelspacing=0.05,bbox_to_anchor=(0.6,0.1))
             else:
-                ax.legend(loc='center',ncol=2,framealpha=1,bbox_to_anchor=(0.5,1.1))
+                ax.legend(loc='lower right',ncol=1,framealpha=0.1,handletextpad=-0.1,columnspacing=0.5)
         ax.tick_params(axis='both', which='major')
         fig.tight_layout()
         
+        # save generated figure
         if save_fig:
             if show_deployed_sensors:
-                fname = self.save_path+f'Map_PotentialLocations_MonitoredLocations{df_coords_monitored.shape[0]}.png'
-            else:
                 fname = self.save_path+f'Map_PotentialLocations_{len(roi_idx)}ROIs.png'
-            fig.savefig(fname,dpi=300,format='png',bbox_inches='tight')
+            else:
+                if len(roi_idx)!=0:
+                    fname = self.save_path+f'Map_PotentialLocations_{len(roi_idx)}ROIs.png'
+                else:
+                    fname = self.save_path+f'Map_PotentialLocations.png'
+            fig.savefig(fname,dpi=600,format='png',bbox_inches='tight')
             print(f'Figure saved at {fname}')
         return fig
         
@@ -818,7 +835,62 @@ class Figures():
             fname = self.save_path+f'Curve_sparsity_singularValues_N{n}.png'
             fig2.savefig(fname,dpi=300,format='png')
             print(f'Figure saved at: {fname}')
-         
+    
+    def singular_values_cumulative_energy_sameFigure(self,sing_vals,n,save_fig=False):
+        """
+        Plot sorted singular values ratio and cumulative energy in the same figure
+
+        Parameters
+        ----------
+        sing_vals : numpy array
+            singular values
+        n : int
+            network size
+        save_fig : bool, optional
+            save generated figures. The default is False.
+
+        Returns
+        -------
+        None.
+
+        """
+        cumulative_energy = np.cumsum(sing_vals)/np.sum(sing_vals)
+        xrange = np.arange(0,sing_vals.shape[0],1)
+        fig = plt.figure(constrained_layout=True)
+        ax = fig.add_subplot(111)
+
+        l1 = ax.plot(xrange, sing_vals / np.max(sing_vals),color='#ba4a00',marker='o',label='Normalized singular values')
+        ax.set_xticks(np.concatenate(([0.0],np.arange(xrange[9],xrange[-1]+1,10))))
+        ax.set_xticklabels([int(i+1) for i in ax.get_xticks()],rotation=0)
+        ax.set_xlabel('$i$th singular value')
+        yrange = np.logspace(-4,0,5)
+        ax.set_yticks(yrange)
+        ax.set_ylabel('Normalized singular values')
+        ax.set_ylim(1e-2,1)
+        ax.set_yscale('log')
+
+        ax2 = ax.twinx()
+        l2 = ax2.plot(xrange,cumulative_energy,color='#1f618d',marker='o',label='Cumulative energy')
+        ax2.set_xticks(np.concatenate(([0.0],np.arange(xrange[9],xrange[-1]+1,10))))
+        ax2.set_xticklabels([int(i+1) for i in ax2.get_xticks()])
+        
+        yrange = np.arange(0.,1.2,0.2)
+        ax2.set_yticks(yrange)
+        ax2.set_yticklabels([np.round(i,2) for i in ax2.get_yticks()])
+        #ax2.set_ylabel('Cumulative energy')
+        ax2.set_ylim(0,1)
+        
+        lines = l1+l2
+        labels = [l.get_label() for l in lines]
+        #ax.legend(lines,labels,loc='center',ncol=1,framealpha=1.,bbox_to_anchor=(0.5,1.15),handlelength=0.5,handletextpad=0.1)
+        #fig.tight_layout()
+        
+        if save_fig:
+            fname = self.save_path+f'Curve_singVals_cumulativeEnergy_N{n}.png'
+            fig.savefig(fname,dpi=600,format='png',bbox_inches='tight')
+            print(f'Figure saved at: {fname}')
+
+
     def boxplot_validation_rmse_svd(self,rmse_sparsity,n,max_sparsity_show=10,synthetic_dataset=False,save_fig=False) -> plt.figure:
         yrange = np.arange(0.0,35,5)
         xrange = rmse_sparsity.columns[:max_sparsity_show]
@@ -1018,25 +1090,20 @@ class Figures():
             fig.tight_layout()
             if save_fig:
                 fname = f'{self.save_path}Curve_errorVariance_Threshold{variance_threshold_ratio:.2f}_Nsensors{n_sensors}.png'
-                fig.savefig(fname,dpi=300,format='png')
+                fig.savefig(fname,dpi=300,format='png',bbox_inches='tight')
                 print(f'Figure saved at {fname}')
 
 
-        else:
+        else: # heterogeneous thresholds over multiple ROIs
             variance_threshold = [t*w for t,w in zip(variance_threshold_ratio,worst_coordinate_variance_fullymonitored)]
             # sort coordinate error variance such that the ROIs are shown in order
             coordinate_error_variance_fully_monitored_sorted = np.concatenate([errorvar_fullymonitored[i] for i in roi_idx.values()])
             coordinate_error_variance_design_sorted = np.concatenate([errorvar_reconstruction[i] for i in roi_idx.values()])
 
-            fig = plt.figure()
+            fig = plt.figure(constrained_layout=True)
             ax = fig.add_subplot(111)
             # coordinate error variance at each location
-            ax.plot(coordinate_error_variance_fully_monitored_sorted,color='#943126',label='Fully monitored network')
-            if len(errorvar_reconstruction_Dopt) !=0:
-                coordinate_error_variance_Dopt_sorted = np.concatenate([errorvar_reconstruction_Dopt[i] for i in roi_idx.values()])
-                ax.plot(coordinate_error_variance_Dopt_sorted,color='orange',label=f'Joshi-Boyd {n_sensors_Dopt} sensors',alpha=0.8)
-            ax.plot(coordinate_error_variance_design_sorted,color='#1a5276',label=f'Network design {n_sensors} sensors')
-            
+            ax.plot(coordinate_error_variance_fully_monitored_sorted,color='#943126',label='Fully monitored case')
             # horizontal lines showing threshold design
             n_roi = np.concatenate([[0],[len(i) for i in roi_idx.values()]])
             n_roi_cumsum = np.cumsum(n_roi)
@@ -1045,6 +1112,13 @@ class Figures():
                     ax.hlines(y=v,xmin=n_roi_cumsum[l]-1,xmax=n_roi_cumsum[l+1]-1,color='k',linestyles='--',label='Design threshold')
                 else:
                     ax.hlines(y=v,xmin=n_roi_cumsum[l],xmax=n_roi_cumsum[l+1]-1,color='k',linestyles='--')
+            
+            # Joshi Boyd and IRNet results
+            if len(errorvar_reconstruction_Dopt) !=0:
+                coordinate_error_variance_Dopt_sorted = np.concatenate([errorvar_reconstruction_Dopt[i] for i in roi_idx.values()])
+                ax.plot(coordinate_error_variance_Dopt_sorted,color='orange',label=f'JB {n_sensors_Dopt} sensors',alpha=0.8)
+            ax.plot(coordinate_error_variance_design_sorted,color='#1a5276',label=f'IRWNet {n_sensors} sensors')
+            
             xrange = np.arange(-1,n,10)
             xrange[0] = 0
             ax.set_xticks(xrange)
@@ -1055,19 +1129,19 @@ class Figures():
             ax.set_yticks(yrange)
             ax.set_yticklabels([np.round(i,2) for i in ax.get_yticks()])
             ax.set_ylim(0,3.0+0.1)
-            ax.set_ylabel('Coordinate error variance')
-            ax.legend(loc='center',ncol=2,framealpha=0.5,bbox_to_anchor=(0.5,1.1))
-            fig.tight_layout()
+            ax.set_ylabel('Per-coordinate error variance')
+            ax.legend(loc='center',ncol=2,framealpha=1,
+                      handlelength=0.5,handletextpad=0.1,columnspacing=0.2,
+                      bbox_to_anchor=(0.5,0.88))
+            #fig.tight_layout()
             if save_fig:
                 #fname = f'{self.save_path}Curve_errorVariance_Threshold{variance_threshold_ratio}_Nsensors{n_sensors}_NsensorsDopt{n_sensors_Dopt}_NsensorsROIDopt_{n_sensors_roi}.png'
                 if method == 'random_based':
                     fname = f'{self.save_path}Curve_errorVariance_VarThreshold{variance_threshold_ratio}_Nsensors{n_sensors}_NsensorsDopt{n_sensors_Dopt}_randomSeed{random_seed}.png'
                 else:
                     fname = f'{self.save_path}Curve_errorVariance_VarThreshold{variance_threshold_ratio}_Nsensors{n_sensors}_NsensorsDopt{n_sensors_Dopt}.png'
-                fig.savefig(fname,dpi=300,format='png')
+                fig.savefig(fname,dpi=300,format='png',bbox_inches='tight')
                 print(f'Figure saved at {fname}')
-
-
 
 
     def curve_rmse_hourly(self,rmse_time,month=0,save_fig=False):
@@ -1093,6 +1167,7 @@ class Figures():
             fig.savefig(fname,dpi=300,format='png')
         return fig
 
+#%%
 
 if __name__ == '__main__':
     """ load dataset to use """
@@ -1126,11 +1201,22 @@ if __name__ == '__main__':
     X_val, X_test = train_test_split(X_test, test_size=test_ratio/(test_ratio + validation_ratio),shuffle=False,random_state=92) 
     print(f'Dataset matrix summary:\n {train_ratio} of dataset for training set with {X_train.shape[0]} measurements from {X_train.index[0]} until {X_train.index[-1]}\n {validation_ratio} of dataset for validation set with {X_val.shape[0]} measurements from {X_val.index[0]} until {X_val.index[-1]}\n {test_ratio} of measuerements for testing set with {X_test.shape[0]} measurements from {X_test.index[0]} until {X_test.index[-1]}')
     
-    """ Exploratory analysis of signal behavior over time"""
-    explore_time_series = False
-    if explore_time_series:
-        plots = Figures(save_path=results_path,marker_size=1,
-                        fs_label=12,fs_ticks=7,fs_legend=6,fs_title=10,
+    execute = 'reconstruct_signal'
+    """
+    The script executes one of the following:
+        - explore_time_serites
+        - determine_sparsity
+        - deploy_sensors_homogeneous
+        - deploy_sensors_heterogeneous
+        - reconstruct_signal
+    """
+    
+    # Exploratory analysis of signal behavior over time
+    if execute == "explore_time_series":
+        plots = Figures(save_path=results_path,
+                        figx=3.5,figy=2.5,
+                        marker_size=1,
+                        fs_label=15,fs_ticks=10,fs_legend=6,fs_title=10,
                         show_plots=True)
         print('Checking full data set')
         plots.curve_timeseries_singlestation(X=X_train,station_name='0',date_init=X_train.index[0],date_end = X_train.index[-1])
@@ -1144,13 +1230,13 @@ if __name__ == '__main__':
         if synthetic_dataset:
             pass
         else:
-            plots.geographical_network_visualization(map_path=f'{files_path}ll_autonomicas_inspire_peninbal_etrs89/',coords_path=files_path,show_legend=False,save_fig=False)
+            plots.geographical_network_visualization(map_path=f'{files_path}ll_autonomicas_inspire_peninbal_etrs89/',df_coordinates=dataset.coordinates.reindex(dataset.distances.index),
+                                                    show_legend=True,show_deployed_sensors=False,save_fig=False)
         plt.show()
         sys.exit()
-
-    """ Get signal sparsity via SVD decomposition"""
-    determine_sparsity = False
-    if determine_sparsity:
+    
+    # Get signal sparsity via SVD decomposition
+    elif execute == 'determine_sparsity':
         # low-rank decomposition
         snapshots_matrix_train = X_train.to_numpy().T
         snapshots_matrix_val = X_val.to_numpy().T
@@ -1174,24 +1260,26 @@ if __name__ == '__main__':
         print(f'Energy threshold of {energy_threshold} reached at singular at singular value index: {signal_sparsity_energy}')
         # dataset and sparsity figures
         plots = Figures(save_path=results_path,marker_size=1,
-                        fs_label=12,fs_ticks=7,fs_legend=6,fs_title=10,
+                        figx=3.5,figy=2.5,
+                        fs_label=13,fs_ticks=13,fs_legend=10,fs_title=10,
                         show_plots=True)
-        plots.singular_values_cumulative_energy(sing_vals,n = X_train.shape[1],synthetic_dataset=synthetic_dataset,save_fig=True)
+        plots.singular_values_cumulative_energy(sing_vals,n = X_train.shape[1],synthetic_dataset=synthetic_dataset,save_fig=False)
+        plots.singular_values_cumulative_energy_sameFigure(sing_vals,n=X_train.shape[1],save_fig=False)
         #fig_rmse_sparsity_train = plots.boxplot_validation_rmse_svd(rmse_sparsity_train,max_sparsity_show=sing_vals.shape[0],save_fig=False)
-        fig_rmse_sparsity_val = plots.boxplot_validation_rmse_svd(rmse_sparsity_val,n=X_train.shape[1],max_sparsity_show=sing_vals.shape[0],synthetic_dataset=synthetic_dataset,save_fig=True)
+        fig_rmse_sparsity_val = plots.boxplot_validation_rmse_svd(rmse_sparsity_val,n=X_train.shape[1],max_sparsity_show=sing_vals.shape[0],synthetic_dataset=synthetic_dataset,save_fig=False)
         plt.show()
         sys.exit()
-    
-    """
-        Network planning algorithm
-            - deploy sensors susch that the reconstructed signal variance is constrained to be lower than specified threshold
-            - deploy single class of senors (called reference stations)
-            - the number of deployed sensors is minimized and unknown a priori
-            - The user-defined threshold design is the same over all locations
-    """
+
     # network design algorithm with homogeneous design threshold
-    deploy_sensors_homogeneous = False
-    if deploy_sensors_homogeneous:
+    elif execute == 'deploy_sensors_homogeneous':
+        """
+            Network planning algorithm
+                - deploy sensors susch that the reconstructed signal variance is constrained to be lower than specified threshold
+                - deploy single class of senors (called reference stations)
+                - the number of deployed sensors is minimized and unknown a priori
+                - The user-defined threshold design is the same over all locations
+        """
+    
         # low-rank decomposition
         snapshots_matrix_train = X_train.to_numpy().T
         snapshots_matrix_val = X_val.to_numpy().T
@@ -1252,8 +1340,7 @@ if __name__ == '__main__':
         sys.exit()
 
     # network design algorithm with heterogeneous design threshold
-    deploy_sensors_heterogeneous = False
-    if deploy_sensors_heterogeneous:
+    elif execute=='deploy_sensors_heterogeneous':
         print(f'\n\nAlgorithm for heterogeneous constraints. Different design threshold will be applied to different Regions of Interest (ROIs)')
         # low-rank decomposition
         snapshots_matrix_train = X_train.to_numpy().T
@@ -1339,9 +1426,11 @@ if __name__ == '__main__':
             
         sys.exit()
 
-    """ Reconstruct signal using measurements at certain locations and compare with actual values """
-    reconstruct_signal = True
-    if reconstruct_signal:
+    # Reconstruct signal using measurements at certain locations and compare with actual values
+    elif execute == 'reconstruct_signal':
+        # Change corresponding Random class for reading and splitting ROIs
+        #   paper results with 2 ROIs random split seed = 0 VarRatio=[1.5,2.0]
+        #   paper results with 3 ROIs random subsplit seed = 0 subsplit seed = 0 varRatio = [1.1,1.5,2.0]
         print('\nReconstructing signal from sparse measurements.\nTwo algorithms are used:\n- Network design\n- Joshi-Boyd (D-optimal) sensor selection.')
         # low-rank decomposition
         snapshots_matrix_train = X_train.to_numpy().T
@@ -1364,7 +1453,6 @@ if __name__ == '__main__':
         Psi = U[:,:signal_sparsity]
         print(f'Basis shape: {Psi.shape}.')
 
-        
         """ Set homogeneous/heterogeneous threshold applied for designing network """
         homogeneous_threshold = False
         if homogeneous_threshold:
@@ -1376,11 +1464,15 @@ if __name__ == '__main__':
             seed_subsplit=0
             rois_split=[0]
             # define ROI
-            roi = ROI(SubSplitRandomRoi())
-            roi.define_rois(seed=random_seed,n=n,n_regions_original=2,rois_split=rois_split,n_regions_subsplit=2,seed_subsplit=seed_subsplit)
+            roi = ROI(RandomRoi()) #[RandomRoi(),SubSplitRandomRoi()]
+            roi.define_rois(seed=random_seed,n=n,n_regions=2)
+            #roi.define_rois(seed=random_seed,n=n,n_regions_original=2,rois_split=rois_split,n_regions_subsplit=2,seed_subsplit=seed_subsplit)
             roi_idx = roi.roi_idx
             roi_threshold,n_regions = [i for i in roi_idx.keys()],len(roi_idx)
-            variance_threshold_ratio = [1.1,1.5,2.0]
+            variance_threshold_ratio = [1.5,2.0]
+            #variance_threshold_ratio = [1.1,1.5,2.0]
+            
+
             # number of deployed sensors by both algorithms
             n_sensors = 38
             n_sensors_Dopt = 38
@@ -1398,10 +1490,11 @@ if __name__ == '__main__':
         if homogeneous_threshold:
             fname = f'{results_path}NetworkDesign/homogeneous/SensorsLocations_N{n}_S{signal_sparsity}_VarThreshold{variance_threshold_ratio:.2f}_nSensors{n_sensors}.pkl'
         else:
-            reader = ReadLocations(ReadSplitRandomFile())
+            reader = ReadLocations(ReadRandomFile())#[ReadRandomFile(),ReadSplitRandomFile()]
             locations_monitored = reader.load_locations(file_path = f'{results_path}NetworkDesign/heterogeneous/random_based/',n=n,signal_sparsity=signal_sparsity,
                                                         variance_threshold_ratio = variance_threshold_ratio,n_sensors = n_sensors,
-                                                        random_seed=random_seed,seed_subsplit=seed_subsplit,rois_split=rois_split)
+                                                        random_seed=random_seed,seed_subsplit=seed_subsplit,rois_split=rois_split,
+                                                        signal_threshold_ratio = variance_threshold_ratio)
 
         locations_unmonitored = [i for i in np.arange(n) if i not in locations_monitored]
         n_locations_monitored = len(locations_monitored)
@@ -1419,14 +1512,14 @@ if __name__ == '__main__':
         # get worst coordinate error variance from empirical signal reconstruction
         project_signal = True
         if project_signal:
+            
             print('Reconstructed signal results.')
             X_test_proj = (Psi@Psi.T@X_test.T).T
             X_test_proj.columns = X_test.columns
             X_test_proj.index = X_test.index
             X_test_proj_noisy = add_noise_signal(X_test_proj,seed=42,var=1.0)
             rmse_design_reconstruction,errorvar_design_reconstruction = signal_reconstruction_regression(Psi,locations_monitored,X_test=X_test_proj,X_test_measurements=X_test_proj_noisy,projected_signal=True)
-            rmse_fullymonitored_reconstruction,errorvar_fullymonitored_reconstruction = signal_reconstruction_regression(Psi,np.arange(n),X_test=X_test_proj,X_test_measurements=X_test_proj_noisy,projected_signal=True)
-            
+            rmse_fullymonitored_reconstruction,errorvar_fullymonitored_reconstruction = signal_reconstruction_regression(Psi,np.arange(n),X_test=X_test_proj,X_test_measurements=X_test_proj_noisy,projected_signal=True)            
             
             # reconstruction using alternative method: Joshi-Boyd (D-optimality)
             try:
@@ -1436,9 +1529,9 @@ if __name__ == '__main__':
                     with open(fname,'rb') as f:
                         locations_monitored_Dopt = np.sort(pickle.load(f))
                 else:
-                    reader = ReadLocations(ReadSplitRandomFileBoyd())
+                    reader = ReadLocations(ReadRandomFileBoyd())#ReadRandomFileBoyd,ReadSplitRandomFileBoyd
                     locations_monitored_Dopt = reader.load_locations(file_path = f'{results_path}Dopt/heterogeneous/random_based/',n=n,signal_sparsity=signal_sparsity,
-                                                        variance_threshold_ratio = variance_threshold_ratio,n_sensors = n_sensors_Dopt,
+                                                        variance_threshold_ratio = variance_threshold_ratio,n_sensors_Dopt = n_sensors_Dopt,
                                                         random_seed=random_seed,seed_subsplit=seed_subsplit,rois_split=rois_split)
 
                 locations_unmonitored_Dopt = [i for i in np.arange(n) if i not in locations_monitored_Dopt]
@@ -1481,7 +1574,8 @@ if __name__ == '__main__':
 
         # visualize        
         plots = Figures(save_path=results_path,marker_size=1,
-                        fs_label=8,fs_ticks=8,fs_legend=4.5,fs_title=10,
+                        figx=3.5,figy=2.5,
+                        fs_label=11,fs_ticks=11,fs_legend=11,fs_title=10,
                         show_plots=True)
             
         if homogeneous_threshold:
@@ -1499,15 +1593,31 @@ if __name__ == '__main__':
                                                  n,n_locations_monitored,
                                                  np.diag(error_variance_Dopt),save_fig=False)
         else:
+            plots = Figures(save_path=results_path,marker_size=1,
+                figx=3.5,figy=2.5,
+                fs_label=11,fs_ticks=11,fs_legend=11,fs_title=10,
+                show_plots=True)
+
             plots.geographical_network_visualization(map_path=f'{files_path}ll_autonomicas_inspire_peninbal_etrs89/',df_coordinates=dataset.coordinates.reindex(dataset.distances.index),
-                                        locations_monitored=locations_monitored_Dopt,roi_idx=roi_idx,show_legend=True,
-                                        show_deployed_sensors=False,save_fig=False)
+                                                        locations_monitored=locations_monitored,roi_idx=roi_idx,show_legend=True,
+                                                        show_deployed_sensors=True,save_fig=False)
+
+            plots = Figures(save_path=results_path,marker_size=1,
+                            figx=3.5,figy=2.5,
+                            fs_label=11,fs_ticks=10,fs_legend=9,fs_title=10,
+                            show_plots=True)
 
             plots.curve_errorvariance_comparison(np.diag(error_variance_fullymonitored),np.diag(error_variance_design),
                                                  variance_threshold_ratio,worst_variance_fullymonitored_roi,
                                                  n,n_locations_monitored,
                                                  np.diag(error_variance_Dopt),roi_idx,n_sensors_Dopt,
-                                                 method='',random_seed=random_seed,save_fig=True)
-                    
+                                                 method='',random_seed=random_seed,save_fig=False)
+
+
         plt.show()
         sys.exit()
+    else:
+        raise ValueError(f'Command to execute ({execute}) not found')
+
+
+# %%

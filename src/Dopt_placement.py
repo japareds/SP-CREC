@@ -369,7 +369,7 @@ def Joshi_Boyd_ROIs(roi_idx:dict,roi_threshold:list,n_sensors_per_roi:list,snaps
 
 def Joshi_Boyd_VarianceThreshold(roi_idx:dict,roi_threshold:list,variance_threshold_ratio:list,snapshots_matrix_train_centered:np.ndarray,reverse_roi_order:bool,force_n:int=-1):
     """
-    Iterative sensor placement over multiple Regions of Interest (ROIs). The
+    Iterative sensor placement over multiple Regions of Interest (ROIs).
     Args:
         roi_idx (dict): Dictionary containing indices of locations asociated with each ROI. The keys correspond to thresholds for defining the ROI
         roi_threshold (list): ROI threshold for defining each ROI
@@ -393,7 +393,6 @@ def Joshi_Boyd_VarianceThreshold(roi_idx:dict,roi_threshold:list,variance_thresh
     
     """ Iterate over ROIs. The solutions of previous ROIs are used onto the next union of ROIs"""
 
-    
     iterator = range(len(roi_threshold))
     indices_rois = [i for i in roi_idx.values()]
     for i in iterator: # ROI iteration
@@ -436,6 +435,8 @@ def Joshi_Boyd_VarianceThreshold(roi_idx:dict,roi_threshold:list,variance_thresh
                 idx_rois = [np.where(np.isin(indices,indices_rois[k]))[0] for k in range(i+1)]
             # idx_monitored = [i for i in indices[idx] if i in indices[locations]]
             # idx_monitored = np.where(np.isin(indices,idx_monitored))[0]
+            
+            # compute covariance matrix
             covariance_matrix_fullymonitored_roi = Psi_roi@np.linalg.inv(Psi_roi.T@Psi_roi)@Psi_roi.T
             covariance_matrix_roi = Psi_roi@np.linalg.inv(Psi_roi.T@sensor_placement.C[1].T@sensor_placement.C[1]@Psi_roi)@Psi_roi.T
             worst_coordinate_variance_fullymonitored_roi = [np.diag(covariance_matrix_fullymonitored_roi)[idx].max() for idx in idx_rois]

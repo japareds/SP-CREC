@@ -60,7 +60,7 @@ class SensorPlacement:
                 Reduced basis of shape (number of locations, number of vectors)
             locations_monitored: list
                 indices of locations that have a sensor
-            locations_unmonitored: lsit
+            locations_unmonitored: list
                 indices of forbidden locations
 
             Returns
@@ -88,6 +88,86 @@ class SensorPlacement:
             self.h = h
             self.problem = problem
     
+    def JB_Trace_placement(self,Psi,locations_monitored:list,locations_unmonitored:list):
+            """
+            Simple A-optimal sensor placement for single class of sensors
+            Minimizes the trace of covariance matrix cov_beta
+            but tr(cov_x) == tr(cov_beta)
+
+            Implemented usng cvxpy library
+
+            min     tr(Psi.T@H@Psi)^-1)
+            s.t.    sum(h) == p
+                    0<= h<= 1
+
+            Parameters
+            ----------
+            Psi : np array
+                Reduced basis of shape (number of locations, number of vectors)
+            locations_monitored: list
+                indices of locations that have a sensor
+            locations_unmonitored: lsit
+                indices of forbidden locations
+
+            Returns
+            -------
+            None.
+
+            """
+            h = cp.Variable(shape=self.n,value=np.zeros(self.n))
+            objective = cp.tr_inv(cp.sum([h[i]*Psi[i,:][None,:].T@Psi[i,:][None,:] for i in range(self.n)]))
+            constraints = [ cp.sum(h) == self.n_refst + self.n_lcs,
+                           h >=0,
+                           h <= 1
+                           ]
+            if len(locations_monitored) != 0:
+                print(f'Adding constraint on {len(locations_monitored)} monitored locations')
+                constraints += [h[locations_monitored] == 1]
+            if len(locations_unmonitored) !=0:
+                print(f'Adding constraint on {len(locations_unmonitored)} unmonitored locations')
+                constraints += [h[locations_unmonitored]==0]
+            problem = cp.Problem(cp.Minimize(objective),constraints)
+
+
+            if not problem.is_dcp():
+                print('Problem not dcp\nCheck constraints and objective function')
+            self.h = h
+            self.problem = problem
+
+    def JB_worst_variance_placement(self,Psi,locations_monitored:list,locations_unmonitored:list,threshold:float=0.):
+            h = cp.Variable(shape=self.n,value=np.zeros(self.n))
+            t = cp.Variable(shape=1,value=100+np.zeros(1))
+            objective = cp.power(t,1)
+            constraints = [cp.sum(h)==self.n_refst+self.n_lcs,
+                           h>=0,
+                           h<=1]
+
+            for i in range(self.n):
+                #e_i = In[:,i]
+                e_i = np.zeros(self.n,dtype=np.float32)
+                e_i[i] = 1
+                r1 = cp.hstack([Psi.T@cp.diag(h)@Psi,Psi.T@e_i[:,None]])
+                r2 = cp.hstack([e_i[:,None].T@Psi,t[:,None]])
+                #r2 = cp.hstack([e_i[:,None].T@Psi,np.array([t])[:,None]])
+                M_i = cp.vstack([r1,r2])
+                constraints += [M_i >> 0]
+
+            if threshold != 0:
+                constraints += [t<=threshold]
+            if len(locations_monitored) != 0:
+                print(f'Adding constraint on {len(locations_monitored)} monitored locations')
+                constraints += [h[locations_monitored] == 1]
+            if len(locations_unmonitored) !=0:
+                print(f'Adding constraint on {len(locations_unmonitored)} unmonitored locations')
+                constraints += [h[locations_unmonitored]==0]
+
+            problem = cp.Problem(cp.Minimize(objective),constraints)
+            if not problem.is_dcp():
+                print('Problem not dcp\nCheck constraints and objective function')
+            self.h = h
+            self.problem = problem
+
+
     def rankMax_placement(self,Psi,alpha,substract=False):
         """
         Sensor placement proposed heuristics for unmonitored locations (p_empty !=0)
@@ -185,8 +265,114 @@ class SensorPlacement:
         self.h_refst = h_refst
         self.problem = problem
 
+    def JB_feasibility_program(self,Psi:np.ndarray,rho:list,locations_monitored:list=[],locations_unmonitored:list=[]):
+        """
+        Sensor placement algorithm that constraints the per coordinate variance-covariance (diagonal)
+        with a fixed number of sensors. 
+        For a low number of sensors the problem would be unfeasible. The problem should be iterated until the problem is feasible and a solution is found.
+        Alhorithm is similar to network design proposed algorithm.
+        Implemented using cvxpy
+
+        min     1
+        s.t.    (cov_x)_ii<=rho ===> M_i>=0 (PSD)
+                sum(h) == p
+                0<=h_i<=1
+                
+
+        Args:
+            Psi (_type_): _description_
+        """
+        t = cp.Variable(shape=1,value=1+np.zeros(1))
+        h = cp.Variable(shape=self.n,value=np.zeros(self.n))
+        objective = 1#cp.power(t,1)
+
+        constraints = [ h >=0,
+                        h <= 1,
+                        cp.sum(h) == self.n_refst + self.n_lcs
+                        ]
+        
+        # PSD constraints
+        if len(rho)!=self.n:
+            raise ValueError(f'Coordinate constraints is not a list of length equivalent to network size.')
+        for i in range(self.n):
+            e_i = np.zeros(self.n,dtype=np.float32)
+            e_i[i] = 1
+            r1 = cp.hstack([Psi.T@cp.diag(h)@Psi,Psi.T@e_i[:,None]])
+            r2 = cp.hstack([e_i[:,None].T@Psi,np.array([rho[i]])[:,None]])
+            M_i = cp.vstack([r1,r2])
+            constraints += [M_i >> 0]
+
+        if len(locations_monitored) !=0:
+            constraints += [h[locations_monitored]==1]
+        if len(locations_unmonitored) != 0:
+            constraints += [h[locations_unmonitored]==0]
+        
+        problem = cp.Problem(cp.Minimize(objective),constraints)
+        if not problem.is_dcp():
+            print('Problem not dcp\nCheck constraints and objective function')
+        self.h = h
+        self.problem = problem
+
+    def JB_feasibility_diagonal(self,Psi:np.ndarray,rho:list,locations_monitored:list=[],locations_unmonitored:list=[]):
+        """
+        Sensor placement algorithm that minimizes the diagonal elements of the 
+        per-coordinate covariance matrix.
+        Implemented using cvxpy library
+        min     sum(t_i)_i=1^n
+        s.t.    t_i >= (Cov_x)_ii
+                rho >= t_i
+                t_i >= 0
+                sum(h) == p
+                0<=h<=1
+
+        Constraint t_i <= (Cov_x)_ii is equivalent to PSD constraint on matrix M_i
+
+        Args:
+            Psi (np.ndarray): _description_
+            rho (list): _description_
+            locations_monitored (list, optional): _description_. Defaults to [].
+            locations_unmonitored (lsit, optional): _description_. Defaults to [].
+        """
+        t = cp.Variable(shape=self.n,value=np.ones(self.n))
+        h = cp.Variable(shape=self.n,value=np.zeros(self.n))
+        objective = cp.sum(t)
+
+        constraints = [ h >=0,
+                        h <= 1,
+                        cp.sum(h) == self.n_refst + self.n_lcs,
+                        t >= 0
+                        ]
+        
+        if len(rho)!=self.n:
+            raise ValueError(f'Coordinate constraints is not a list of length equivalent to network size.')
+        # threshold constraints
+        constraints += [rho>=t]
+        # PSD constraints
+        for i in range(self.n):
+            e_i = np.zeros(self.n,dtype=np.float32)
+            e_i[i] = 1
+            r1 = cp.hstack([Psi.T@cp.diag(h)@Psi,Psi.T@e_i[:,None]])
+            r2 = cp.hstack([e_i[:,None].T@Psi,cp.reshape(t[i],(1,1))])
+            M_i = cp.vstack([r1,r2])
+            constraints += [M_i >> 0]
+        
+        # constraints forcing certain indices to be (un)monitored
+        if len(locations_monitored) !=0:
+            constraints += [h[locations_monitored]==1]
+        if len(locations_unmonitored) != 0:
+            constraints += [h[locations_unmonitored]==0]
+        
+        problem = cp.Problem(cp.Minimize(objective),constraints)
+        if not problem.is_dcp():
+            print('Problem not dcp\nCheck constraints and objective function')
+        self.h = h
+        self.problem = problem
+
+
     def networkPlanning_singleclass(self,Psi:np.ndarray,rho:float):
         """
+        Implemented using cvxpy
+
         min |h|_1
         s.t. -  0<=h<=1
              -  sum(h) >=s
@@ -222,7 +408,8 @@ class SensorPlacement:
         """
         Network design algorithm using Candes IRL1 objective function and Rusu method to ensure binary solution.
         The lists must be updated iteratively when calling this method from the solution h.
-
+        Implemented using cvxpy library
+        
         min     w.T @ h
         s.t.    - 0<=h<=1
                 - h[S] == 1
@@ -279,6 +466,7 @@ class SensorPlacement:
         """
         Network design algorithm using Candes IRL1 objective function and Rusu method to ensure binary solution.
         The lists must be updated iteratively when calling this method from the solution h.
+        Implemented using cvxpy library
         
         Alternate method.
         Differs from non-LMI version in that the M_i >> 0, i=1,...,n is replaced with the LMI from Rn -> cone Sn+
@@ -321,6 +509,7 @@ class SensorPlacement:
         """
         Network design algorithm using Candes IRL1 objective function and Rusu method to ensure binary solution.
         The lists must be updated iteratively when calling this method from the solution h.
+        Implemented using cvxopt library
 
         Equality constraints are unsupported by cvxopt solver. Using ineq constraint of epsilon tolerance
         min     w.T @ h
@@ -346,39 +535,53 @@ class SensorPlacement:
         #C_forbidden = In[locations_forbidden,:]
         #matrix_eq = sparse([C_monitored,C_unmonitored])
         #vector_eq = matrix([matrix(np.tile(1,len(locations_monitored))),matrix(np.tile(0,len(locations_unmonitored)))],tc='d')
-        """ inequality constraints """
-        # order of constraints: h>=0 | h<=1 | sum(h)>= s | h[S]>= 1-eps | h[Sc] <= eps | h[Sf] <=eps
+        """ inequality constraints 
+            order of constraints: h>=0 | h<=1 | sum(h)>= s | h[S]>= 1-eps | h[Sc] <= eps | h[Sf] <=eps
+        """
         matrix_ineq = sparse([spdiag(matrix(-1,(self.n,1))),
                               spdiag(matrix(1,(self.n,1))),
                               matrix(-1,(1,self.n)),
                               sparse(-1*C_monitored),
                               sparse(C_unmonitored)])
                               #sparse(C_forbidden)])
-        
+
         vector_ineq = matrix([matrix(np.tile(0,self.n)),
                               matrix(np.tile(1,self.n)),
                               -self.s.astype(np.double),
                               matrix(np.tile(-(1-epsilon),len(locations_monitored))),
                               matrix(np.tile(epsilon,len(locations_unmonitored)))],tc='d')
                               #matrix(np.tile(epsilon,len(locations_forbidden))) ],tc='d')
+
+        """ SDP constraints
+            order of constraints: -rho_i*sum_j (Psi_j.T*Psi_j)*h_j <= -Psi_i.T*Psi_i       """
         # LMI constraint
-        #matrix_sdp = [sparse([np.reshape(-rho*Psi[i,:][None,:].T@Psi[i,:][None,:],newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
-        #vector_sdp = [matrix(-1*Psi[i,:][None,:].T@Psi[i,:][None,:]) for i in range(self.n)]
+        # constant rho
         if type(rho) in [float,np.float32,np.float64]:
             matrix_sdp = [sparse([np.reshape(np.tril(-rho*Psi[i,:][None,:].T@Psi[i,:][None,:]),newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
+            #matrix_sdp = [sparse([np.reshape(np.tril(-rho*Psi[i,:][None,:].T@Psi[i,:][None,:]),newshape=s*s,order='F').tolist() for i in range(n)])]*n
         elif len(rho) == 1:
             matrix_sdp = [sparse([np.reshape(np.tril(-rho[0]*Psi[i,:][None,:].T@Psi[i,:][None,:]),newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
+        # different rho at different locations
+        elif len(rho) != self.n:
+            raise ValueError(f'Design threshold rho is a list of {len(rho)} elements but there are {self.n} potential locations.')
         else:
-            matrix_sdp = [sparse([np.reshape(np.tril(-rho[i]*Psi[i,:][None,:].T@Psi[i,:][None,:]),newshape=self.s*self.s,order='F').tolist() for i in range(self.n)])]*self.n
+            matrix_sdp = [sparse([np.reshape(np.tril(-rho[i]*Psi[j,:][None,:].T@Psi[j,:][None,:]),newshape=self.s*self.s,order='F').tolist() for j in range(self.n)]) for i in range(self.n)]
         print(f'Basis type: {type(Psi)}. Basis dtype: {Psi.dtype}')
         vector_sdp = [matrix(np.tril(-1*Psi[i,:][None,:].T@Psi[i,:][None,:]).astype(float)) for i in range(self.n)]
+        
+        
         # solver and solution
         print('Calling SDP solver')
         try:
-            self.problem = solvers.sdp(c,Gl=matrix_ineq,hl=vector_ineq,Gs=matrix_sdp,hs=vector_sdp,verbose=True,solver='dsdp',primalstart=primal_start)
+            solvers.options['show_progress'] = False
+            self.problem = solvers.sdp(c,Gl=matrix_ineq,hl=vector_ineq,Gs=matrix_sdp,hs=vector_sdp,verbose=False,solver='dsdp',primalstart=primal_start)
+            print('dsdp solver found')
         except:    
-            self.problem = solvers.sdp(c,Gl=matrix_ineq,hl=vector_ineq,Gs=matrix_sdp,hs=vector_sdp,verbose=True)
+            print('Solving using non-specialized solver')
+            solvers.options['show_progress'] = False
+            self.problem = solvers.sdp(c,Gl=matrix_ineq,hl=vector_ineq,Gs=matrix_sdp,hs=vector_sdp,verbose=False)
         self.h = np.array(self.problem['x'])
+        
 
 
     def IRNet_ROIs(self,Psi:np.ndarray,rho:float,w:np.array,locations_monitored:list=[],locations_unmonitored:list=[],epsilon:float=1e-2,primal_start={'x':[],'sl':[],'ss':[]},include_sparsity_constraint:str=True):
@@ -386,7 +589,8 @@ class SensorPlacement:
         Network design algorithm using Candes IRL1 objective function and Rusu method to ensure binary solution.
         Method for constrinaing the maximum error variance over a subset ROI
         The lists must be updated iteratively when calling this method from the solution h.
-        Equality constraints are unsupported by cvxopt solver. Using ineq constraint of epsilon tolerance
+        Equality constraints are unsupported by cvxopt solver. Using ineq constraint of epsilon tolerance.
+        Implemented using cvxopt library
 
         min     w.T @ h
         s.t.    - 0<=h<=1
@@ -601,7 +805,7 @@ class SensorPlacement:
         if self.algorithm not in ['IRNet_ROI','IRL1ND']:
             self.check_consistency()
         
-        algorithms = ['rankMax','MCJB','JB','NetworkPlanning','NetworkPlanning_iterative','NetworkPlanning_iterative_LMI','IRL1ND','IRL1ND_candes','IRNet_ROI']
+        algorithms = ['rankMax','MCJB','JB','JB_trace','JB_worst_variance','JB_feasibility_program','JB_feasibility_diagonal','NetworkPlanning','NetworkPlanning_iterative','NetworkPlanning_iterative_LMI','IRL1ND','IRL1ND_candes','IRNet_ROI']
 
         if self.algorithm not in algorithms:
             print(f'Sensor placement algorithm {self.algorithm} not implemented yet')
@@ -615,29 +819,40 @@ class SensorPlacement:
                 self.multiClass_joshiBoyd_placement(Psi)
             else:
                 self.rankMax_placement(Psi,alpha)
-
+        
+        # Joshi-Boyd based algorithms
         elif self.algorithm == 'MCJB':
             print(f'Setting {self.algorithm} sensor placement algorithm')
             self.multiClass_joshiBoyd_placement(Psi)
-        
         elif self.algorithm == 'JB':
             print(f'Setting {self.algorithm} sensor placement algorithm')
             self.JB_placement(Psi,locations_monitored,locations_unmonitored)
+        elif self.algorithm == 'JB_trace':
+            print(f'Setting {self.algorithm} sensor placement algorithm')
+            self.JB_Trace_placement(Psi,locations_monitored,locations_unmonitored)
+        elif self.algorithm == 'JB_worst_variance':
+            print(f'Setting {self.algorithm} sensor placement algorithm')
+            self.JB_worst_variance_placement(Psi,locations_monitored,locations_unmonitored)
+        elif self.algorithm == 'JB_feasibility_program':
+            print(f'Setting {self.algorithm} sensor placement algorithm')
+            self.JB_feasibility_program(Psi,rho,locations_monitored,locations_unmonitored)
+        elif self.algorithm == 'JB_feasibility_diagonal':
+            print(f'Setting {self.algorithm} sensor placement algorithm')
+            self.JB_feasibility_diagonal(Psi,rho,locations_monitored,locations_unmonitored)
 
         elif self.algorithm == 'NetworkPlanning':
             print(f'Setting {self.algorithm} sensor placement algorithm')
             self.networkPlanning_singleclass(Psi,rho)
-        
-        elif self.algorithm == 'NetworkPlanning_iterative':
+        elif self.algorithm == 'NetworkPlanning_iterative':#cvxpy
             print(f'Setting {self.algorithm} sensor placement algorithm')
             self.networkPlanning_singleclass_iterative(Psi,rho,w,locations_monitored,locations_unmonitored)
-        elif self.algorithm == 'NetworkPlanning_iterative_LMI':
+        elif self.algorithm == 'NetworkPlanning_iterative_LMI':#cvxpy
             print(f'Setting {self.algorithm} sensor placement algorithm')
             self.networkPlanning_singleclass_iterative_LMI(Psi,rho,w,locations_monitored,locations_unmonitored)
-        elif self.algorithm == 'IRL1ND' or self.algorithm == 'IRL1ND_candes':
+        elif self.algorithm == 'IRL1ND' or self.algorithm == 'IRL1ND_candes':#cvxopt
             print(f'{self.algorithm} sensor placement algorithm')
             self.IRL1_networkDesign(Psi,rho,w,locations_monitored,locations_unmonitored,epsilon,primal_start)
-        elif self.algorithm == 'IRNet_ROI':
+        elif self.algorithm == 'IRNet_ROI':#cvxopt
             print(f'IRNet algorithm for large-scale deployments using ROIs')
             self.IRNet_ROIs(Psi,rho,w,locations_monitored,locations_unmonitored,epsilon,primal_start,include_sparsity_constraint)
 
@@ -766,11 +981,23 @@ class SensorPlacement:
             order_lcs = np.sort(np.setdiff1d(self.loc_monitored,order_refst))
             order_unmonitored = np.sort(self.loc_unmonitored)
         
+        # sensor placement algorithms with single class of sensors
         elif self.algorithm == 'JB':
             order_lcs = []
             order_refst = np.sort(np.argsort(self.h.value)[-self.n_refst:])
             order_unmonitored = np.sort([i for i in np.arange(self.n) if i not in order_refst])
-        
+        elif self.algorithm == 'JB_trace':
+            order_lcs = []
+            order_refst = np.sort(np.argsort(self.h.value)[-self.n_refst:])
+            order_unmonitored = np.sort([i for i in np.arange(self.n) if i not in order_refst])
+        elif self.algorithm == 'JB_worst_variance':
+            order_lcs = []
+            order_refst = np.sort(np.argsort(self.h.value)[-self.n_refst:])
+            order_unmonitored = np.sort([i for i in np.arange(self.n) if i not in order_refst])
+        elif self.algorithm in ['JB_feasibility_program','JB_feasibility_diagonal']:
+            order_lcs = []
+            order_refst = np.sort(np.argsort(self.h.value)[-self.n_refst:])
+            order_unmonitored = np.sort([i for i in np.arange(self.n) if i not in order_refst])
         elif self.algorithm == 'NetworkPlanning':
             self.n_refst = int(np.round(self.h.value.sum()))
             order_lcs = []
@@ -1136,31 +1363,37 @@ if __name__ == '__main__':
     energy_threshold = 0.9
     sparsity_energy = np.where(cumulative_energy>=energy_threshold)[0][0]
     print(f'Cumulative energy surpasses the threshold of {energy_threshold:.2f} at index: {sparsity_energy}')
-    sparsity_energy+=1
     Psi = U[:,:sparsity_energy]
-    fully_monitored_network_max_variance = np.diag(Psi@np.linalg.inv(Psi.T@Psi)@Psi.T).max()
-    variance_threshold_ratio = 1.5
-    deployed_network_accuracy_threshold = variance_threshold_ratio*fully_monitored_network_max_variance
     print(f'Network parameters:\n - network size: {N}\n - signal sparsity: {sparsity_energy}\n - snapshots matrix shape: {snapshots_matrix.shape}\n - Psi basis shape: {Psi.shape}')
     
+    """ compute variance-covariance matrix """
+    coordinate_error_variance_fullymonitored = np.diag(Psi@np.linalg.inv(Psi.T@Psi)@Psi.T)
+    maxvariance_fullymonitored = coordinate_error_variance_fullymonitored.max()
+    variance_threshold_ratio = 10.
+    design_threshold = variance_threshold_ratio*maxvariance_fullymonitored
+    print(f'Network design parameters:\n - worst coordinate error variance fully monitored network: {maxvariance_fullymonitored:.3f}\n - design threshold: {variance_threshold_ratio:.2f}\n - design variance threshold: {design_threshold:.3f}')
+    
     """ Solve network planning problem """
-    algorithm = 'IRL1ND'#['NetworkPlanning_iterative','IRL1ND','IRNet_ROI']
+    algorithm = 'IRL1ND'#['NetworkPlanning_iterative','IRL1ND']
+    locations_monitored = []
+    locations_unmonitored = []
     sensor_placement = SensorPlacement(algorithm, N, sparsity_energy,N_REFST,N_LCS,N_UNMONITORED)
+    epsilon = 5e-2
+    n_it = 20
+    h_prev = np.zeros(N)
+    if len(locations_monitored) !=0:
+        h_prev[locations_monitored] = 1
+    w = 1/(h_prev+epsilon)
+    it = 0
+
     if algorithm == 'IRL1ND':
         """ Uses cvxopt library """
-        h_prev = np.zeros(N)
-        epsilon = 1e-2
-        w = 1/(h_prev+epsilon)
-        n_it = 20
-        it = 0
-        locations_monitored = []
-        locations_unmonitored = []
         primal_start = {'x':[],'sl':[],'ss':[]}
         # iterative method
         time_init = time.time()
         while len(locations_monitored) + len(locations_unmonitored) != N:
             # solve sensor placement with constraints
-            sensor_placement.initialize_problem(Psi,rho=deployed_network_accuracy_threshold,
+            sensor_placement.initialize_problem(Psi,rho=design_threshold,
                                                 w=w,locations_monitored=locations_monitored,locations_unmonitored=locations_unmonitored,
                                                 epsilon=epsilon,primal_start=primal_start)
             if sensor_placement.problem['status'] == 'optimal':
@@ -1178,12 +1411,14 @@ if __name__ == '__main__':
                     locations_monitored += [[int(i[0]) for i in np.argsort(sensor_placement.h,axis=0)[::-1] if i not in locations_monitored][0]]
                     it = 0
                 h_prev = sensor_placement.h
+                w_old = w.copy()
                 w = 1/(h_prev + epsilon)
                 it +=1
                 print(f'Iteration results\n ->Primal objective: {sensor_placement.problem["primal objective"]:.6f}\n ->{len(locations_monitored) + len(locations_unmonitored)} locations assigned\n ->{len(locations_monitored)} monitored locations\n ->{len(locations_unmonitored)} unmonitored locations\n')
             else:
                 # solver fails at iteration
-                locations_monitored = locations_monitored[:-len(new_monitored)]
+                w = w_old
+                #locations_monitored = locations_monitored[:-len(new_monitored)]
                 locations_unmonitored = locations_unmonitored[:-len(new_unmonitored)]
                 it+=1
         time_end = time.time()
@@ -1211,7 +1446,7 @@ if __name__ == '__main__':
         
         while it < n_it:
             # solve sensor placement with constraints
-            sensor_placement.initialize_problem(Psi,rho=deployed_network_accuracy_threshold,
+            sensor_placement.initialize_problem(Psi,rho=design_threshold,
                                                 w=w,locations_monitored=locations_monitored,locations_unmonitored=locations_unmonitored)
         
             if np.linalg.norm(sensor_placement.h - h_prev)<=epsilon:
@@ -1231,23 +1466,16 @@ if __name__ == '__main__':
 
     elif algorithm == 'NetworkPlanning_iterative':
         """ Uses cvxpy library. LMIs are not explicitly expressed """
-        # algorithm initialization
-        h_prev = np.zeros(N)
-        epsilon = 1e-2
-        w = 1/(h_prev+epsilon)
-        n_it = 3
-        it = 0
-        locations_monitored = []
-        locations_unmonitored = []
 
         # iterative method
         time_init = time.time()
         while len(locations_monitored) + len(locations_unmonitored) != N:
             # solve sensor placement with constraints
-            sensor_placement.initialize_problem(Psi,rho=deployed_network_accuracy_threshold,
+            sensor_placement.initialize_problem(Psi,rho=design_threshold,
                                                 w=w,locations_monitored=locations_monitored,locations_unmonitored=locations_unmonitored)
             sensor_placement.solve()
             # update sets
+            
             locations_monitored += [i[0] for i in np.argwhere(sensor_placement.h.value >= 1-epsilon) if i[0] not in locations_monitored]
             locations_unmonitored += [i[0] for i in np.argwhere(sensor_placement.h.value <= epsilon) if i[0] not in locations_unmonitored]
             # check convergence
@@ -1258,12 +1486,13 @@ if __name__ == '__main__':
             w = 1/(h_prev + epsilon)
             it +=1
             print(f'{len(locations_monitored)} Locations monitored: {locations_monitored}\n{len(locations_unmonitored)} Locations unmonitored: {locations_unmonitored}\n')
+        
         time_end = time.time()
         sensor_placement.locations = [[],np.sort(locations_monitored),np.sort(locations_unmonitored)]
         sensor_placement.C_matrix()
 
     elif algorithm == 'NetworkPlanning':
-        sensor_placement.initialize_problem(Psi,rho=deployed_network_accuracy_threshold)
+        sensor_placement.initialize_problem(Psi,rho=design_threshold)
         time_init = time.time()
         sensor_placement.solve()
         sensor_placement.discretize_solution()
@@ -1313,7 +1542,7 @@ if __name__ == '__main__':
             n_roi = Psi_roi.shape[0]
             print(f'Number of potential locations in ROI: {n_roi}')
             print(f'Fully monitored max error variance in ROI: {fully_monitored_network_max_variance_roi:.2f}\nDesign max error variance in ROI: {deployed_network_variance_threshold_roi:.2f}')
-            print(f'Overall fully monitored max error variance: {fully_monitored_network_max_variance:.2f}\nOverall design max error variance: {deployed_network_accuracy_threshold:.2f}')
+            print(f'Overall fully monitored max error variance: {maxvariance_fullymonitored:.2f}\nOverall design max error variance: {design_threshold:.2f}')
 
             # IRNet method parameters            
             sensor_placement = SensorPlacement(algorithm,n_roi,sparsity_energy,n_refst=n_roi,n_lcs=0,n_unmonitored=0)
@@ -1402,7 +1631,7 @@ if __name__ == '__main__':
         sensor_placement.C_matrix()
 
     deployed_network_accuracy = np.diag(Psi@np.linalg.inv(Psi.T@sensor_placement.C[1].T@sensor_placement.C[1]@Psi)@Psi.T).max()
-    print(f'Discretized network solution:\n- Number of potential locations: {sensor_placement.n}\n- Number of monitored locations: {sensor_placement.locations[1].shape}\nMonitored locations: {sensor_placement.locations[1]}\n- Number of unmonitored locations: {sensor_placement.locations[2].shape}\n- Fully monitoring network maximum signal variance: {fully_monitored_network_max_variance:.2f}\n- Network design worst coordinate error variance threshold: {deployed_network_accuracy_threshold:.2f}\n- Deployed monitoring network maximum variance: {deployed_network_accuracy:.2f}')
+    print(f'Discretized network solution:\n- Number of potential locations: {sensor_placement.n}\n- Number of monitored locations: {sensor_placement.locations[1].shape}\nMonitored locations: {sensor_placement.locations[1]}\n- Number of unmonitored locations: {sensor_placement.locations[2].shape}\n- Fully monitoring network maximum signal variance: {maxvariance_fullymonitored:.2f}\n- Network design worst coordinate error variance threshold: {design_threshold:.2f}\n- Deployed monitoring network maximum variance: {deployed_network_accuracy:.2f}')
     print("\u0332".join(f"Finished in {time_end-time_init:.2f}s"))
     
     

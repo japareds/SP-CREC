@@ -5,7 +5,7 @@
 #SBATCH --output=/scratch/nas/3/jparedes/IRNet/outputs/output-IRNet_design-%j-%N.out
 #SBATCH --error=/scratch/nas/3/jparedes/IRNet/errors/error-IRNet_design-%j-%N.out
 
-epsilon=7e-2
+epsilon=5e-2
 num_it=20
 
-python network_design_SST.py --design_network -e ${epsilon} -n_it ${num_it}
+python network_design_SST.py --design_large_networks -e ${epsilon} -n_it ${num_it}
