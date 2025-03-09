@@ -292,37 +292,59 @@ class ReadLocations():
 
 
 # signal reconstruction functions
-def signal_reconstruction_svd(U:np.ndarray,snapshots_matrix_train:np.ndarray,snapshots_matrix_val_centered:np.ndarray,X_val:pd.DataFrame,s_range:np.ndarray) -> pd.DataFrame:
+def singular_value_hard_threshold(snapshots_matrix:np.ndarray,sing_vals:np.array)->float:
+    """
+    Compute singular value hard threshold from Gavish-Donoho approximation
+
+    Args:
+        snapshots_matrix (np.ndarray): snapshots matrix used for computing SVD
+        sing_vals (np.array): corresponding array of singular values
+
+    Returns:
+        float: cut-off index
+    """
+    beta = snapshots_matrix.shape[0]/snapshots_matrix.shape[1]
+    c1,c2,c3,c4 = 0.56,0.95,1.82,1.43
+    omega = c1*beta**3 - c2*beta**2 + c3*beta + c4
+    sing_val_threshold = omega*np.median(sing_vals)
+    sparsity_gd = np.argwhere(sing_vals>=sing_val_threshold)[-1][0]
+    return sparsity_gd
+
+def signal_reconstruction_svd(U:np.ndarray,snapshots_matrix_train:np.ndarray,snapshots_matrix_centered:np.ndarray,X_dataset:pd.DataFrame,s_range:np.ndarray) -> pd.DataFrame:
     """
     Decompose signal keeping s-first singular vectors using training set data
     and reconstruct validation set.
 
     Args:
         U (numpy array): left singular vectors matrix
-        snapshots_matrix_train (numpy array): snaphots matrix of training set data
-        snapshots_matrix_val_centered (numpy array): snapshots matrix of validation set data
-        X_val (pandas dataframe): validation dataset
+        snapshots_matrix_train (numpy array): snaphots matrix of training set data. Used for computing average snapshot
+        snapshots_matrix_centered (numpy array): (centered) snapshots matrix to be projected
+        X_dataset (pandas dataframe): dataset with n_rows measurements and n_cols locations. (Uncentered) snapshots_matrix.T
         s_range (numpy array): list of sparsity values to test
 
     Returns:
         rmse_sparsity: dataframe containing reconstruction errors at different times for each sparsity threshold in the range
     """
     print(f'Determining signal sparsity by decomposing training set and reconstructing validation set.\nRange of sparsity levels: {s_range}')
-    rmse_sparsity = pd.DataFrame()
+    mse_sparsity = pd.DataFrame()
     for s in s_range:
         # projection
         Psi = U[:,:s]
-        snapshots_matrix_val_pred_svd = (Psi@Psi.T@snapshots_matrix_val_centered) + snapshots_matrix_train.mean(axis=1)[:,None]
-        X_pred_svd = pd.DataFrame(snapshots_matrix_val_pred_svd.T)
-        X_pred_svd.columns = X_val.columns
-        X_pred_svd.index = X_val.index
+        snapshots_matrix_pred_svd = (Psi@Psi.T@snapshots_matrix_centered) + snapshots_matrix_train.mean(axis=1)[:,None]
+        X_pred_svd = pd.DataFrame(snapshots_matrix_pred_svd.T)
+        X_pred_svd.columns = X_dataset.columns
+        X_pred_svd.index = X_dataset.index
         
         #RMSE across different signal measurements
-        rmse = pd.DataFrame(np.sqrt(((X_val - X_pred_svd)**2).mean(axis=1)),columns=[s],index=X_val.index)
-        rmse_sparsity = pd.concat((rmse_sparsity,rmse),axis=1)
-    return rmse_sparsity
+        # estimated covariance
+        error = X_dataset - X_pred_svd
+        mse = pd.DataFrame((((error)**2).mean(axis=1)),columns=[s],index=X_dataset.index)
+        mse_sparsity = pd.concat((mse_sparsity,mse),axis=1)
+        error_variance = error.var(axis=0,ddof=0) # estiamted coordinate error variance
 
-def signal_reconstruction_regression(Psi:np.ndarray,locations_measured:np.ndarray,X_test:pd.DataFrame,X_test_measurements:pd.DataFrame=[],snapshots_matrix_train:np.ndarray=[],snapshots_matrix_test_centered:np.ndarray=[],projected_signal:bool=False)->pd.DataFrame:
+    return mse_sparsity
+
+def signal_reconstruction_regression(Psi:np.ndarray,locations_measured:np.ndarray,X_test:pd.DataFrame,X_test_measurements:pd.DataFrame=[],snapshots_matrix_train:np.ndarray=[],snapshots_matrix_test_centered:np.ndarray=[],projected_signal:bool=False,sample_covariance:bool=True)->pd.DataFrame:
     """
     Signal reconstyruction from reduced basis measurement.
     The basis Psi and the measurements are sampled at indices in locations_measured.
@@ -361,7 +383,7 @@ def signal_reconstruction_regression(Psi:np.ndarray,locations_measured:np.ndarra
     # compute error metrics
     error = X_test - X_pred
     rmse = pd.DataFrame(np.sqrt(((error)**2).mean(axis=1)),columns=[n_sensors_reconstruction],index=X_test.index)
-    error_variance = error.var()
+    error_variance = error.var(axis=0,ddof=0)
     """
     error_max = pd.DataFrame(np.abs(error).max(axis=1),columns=[n_sensors_reconstruction],index=X_test.index)
     error_var = np.zeros(shape = error.shape)
@@ -1251,7 +1273,8 @@ if __name__ == '__main__':
         s_range = np.arange(1,sing_vals.shape[0]+1,1)
         rmse_sparsity_train = signal_reconstruction_svd(U,snapshots_matrix_train,snapshots_matrix_train_centered,X_train,s_range)
         rmse_sparsity_val = signal_reconstruction_svd(U,snapshots_matrix_train,snapshots_matrix_val_centered,X_val,s_range)
-        rmse_threshold = 5
+        """O3 Envea device: sigma=0.1ppb=1*1.96 ug/m3"""
+        rmse_threshold = (1*1.96)**2
         signal_sparsity = np.argwhere(rmse_sparsity_val.median(axis=0).to_numpy()<=rmse_threshold)[0][0] + 1
         print(f'Reconstruction error is lower than specified threshold {rmse_threshold} in validation set at sparsity of {signal_sparsity}.\nTraining set error of {rmse_sparsity_train.median(axis=0)[signal_sparsity]:.2f}\nValidation set error of {rmse_sparsity_val.median(axis=0)[signal_sparsity]:.2f}\nSingular value ratio: {sing_vals[signal_sparsity]/sing_vals[0]:.2f}\nCumulative energy: {(sing_vals.cumsum()/sing_vals.sum())[signal_sparsity]:.2f}')        
         cumulative_energy = np.cumsum(sing_vals)/np.sum(sing_vals)
@@ -1514,9 +1537,9 @@ if __name__ == '__main__':
         if project_signal:
             
             print('Reconstructed signal results.')
-            X_test_proj = (Psi@Psi.T@X_test.T).T
-            X_test_proj.columns = X_test.columns
-            X_test_proj.index = X_test.index
+            X_test_proj = (Psi@Psi.T@X_train.T).T
+            X_test_proj.columns = X_train.columns
+            X_test_proj.index = X_train.index
             X_test_proj_noisy = add_noise_signal(X_test_proj,seed=42,var=1.0)
             rmse_design_reconstruction,errorvar_design_reconstruction = signal_reconstruction_regression(Psi,locations_monitored,X_test=X_test_proj,X_test_measurements=X_test_proj_noisy,projected_signal=True)
             rmse_fullymonitored_reconstruction,errorvar_fullymonitored_reconstruction = signal_reconstruction_regression(Psi,np.arange(n),X_test=X_test_proj,X_test_measurements=X_test_proj_noisy,projected_signal=True)            
@@ -1612,7 +1635,13 @@ if __name__ == '__main__':
                                                  n,n_locations_monitored,
                                                  np.diag(error_variance_Dopt),roi_idx,n_sensors_Dopt,
                                                  method='',random_seed=random_seed,save_fig=False)
-
+            """ estiamted covariance from data
+            plots.curve_errorvariance_comparison(errorvar_fullymonitored_reconstruction.values,errorvar_design_reconstruction.values,
+                                                 variance_threshold_ratio,worst_variance_fullymonitored_roi,
+                                                 n,n_locations_monitored,
+                                                 errorvar_Dopt_reconstruction.values,roi_idx,n_sensors_Dopt,
+                                                 method='',random_seed=random_seed,save_fig=False)
+            """
 
         plt.show()
         sys.exit()
